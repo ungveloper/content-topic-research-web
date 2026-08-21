@@ -377,6 +377,16 @@ export function ResearchWorkbench() {
     [candidates, activeCandidateId],
   );
 
+  const sortedCandidates = useMemo(
+    () =>
+      [...candidates].sort((a, b) => {
+        const scoreDiff = scoreCandidate(b) - scoreCandidate(a);
+        if (scoreDiff !== 0) return scoreDiff;
+        return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+      }),
+    [candidates],
+  );
+
   const dashboard = useMemo(() => {
     const approved = candidates.filter((candidate) => scoreCandidate(candidate) >= 78).length;
     const hold = candidates.filter((candidate) => scoreCandidate(candidate) < 60).length;
@@ -388,7 +398,8 @@ export function ResearchWorkbench() {
     const sample = createSampleData();
     setSignals(sample.signals);
     setCandidates(sample.candidates);
-    setActiveCandidateId(sample.candidates[0].id);
+    const topSample = [...sample.candidates].sort((a, b) => scoreCandidate(b) - scoreCandidate(a))[0];
+    setActiveCandidateId(topSample?.id || null);
     setSelectedSignalIds([]);
     setToast("샘플 리서치를 불러왔습니다.");
   }
@@ -499,7 +510,8 @@ export function ResearchWorkbench() {
       setAutoResearchOffset(offset);
       setAutoResearchSeeds(Array.isArray(data.seeds) ? data.seeds : []);
       setAutoResearchWarnings(Array.isArray(data.errors) ? data.errors : []);
-      if (normalizedCandidates[0]) setActiveCandidateId(normalizedCandidates[0].id);
+      const topIncoming = [...normalizedCandidates].sort((a, b) => scoreCandidate(b) - scoreCandidate(a))[0];
+      if (topIncoming) setActiveCandidateId(topIncoming.id);
       setToast(`자동 탐색 완료 · 주제 후보 ${normalizedCandidates.length}개를 만들었습니다.`);
     } catch (error) {
       setAutoResearchError(error instanceof Error ? error.message : "자동 탐색에 실패했습니다.");
@@ -765,9 +777,10 @@ export function ResearchWorkbench() {
         </div>
       </header>
 
-      <div className="mx-auto max-w-[1500px] px-4 py-5 sm:px-6 lg:grid lg:grid-cols-[210px_minmax(0,1fr)] lg:gap-6">
-        <aside className="mb-5 lg:mb-0">
-          <nav className="flex gap-2 overflow-x-auto pb-1 lg:sticky lg:top-20 lg:block lg:space-y-1">
+      <div className="mx-auto max-w-[1500px] px-4 py-5 sm:px-6 lg:grid lg:grid-cols-[220px_minmax(0,1fr)] lg:gap-7">
+        <aside className="mb-5 lg:sticky lg:top-20 lg:z-20 lg:mb-0 lg:self-start">
+          <div className="rounded-2xl bg-[#f7f7f5] lg:p-1">
+          <nav className="flex gap-2 overflow-x-auto pb-1 lg:block lg:space-y-1">
             {([
               ["discover", "탐색", SearchIcon],
               ["candidates", "주제 후보", LayersIcon],
@@ -800,6 +813,7 @@ export function ResearchWorkbench() {
               <li>공식자료 = 무엇이 사실인지</li>
               <li>60점 미만 = 제작 보류</li>
             </ul>
+          </div>
           </div>
         </aside>
 
@@ -1073,7 +1087,7 @@ export function ResearchWorkbench() {
                   <button type="button" onClick={createBlankCandidate} className="flex h-9 w-9 items-center justify-center rounded-xl bg-zinc-900 text-white hover:bg-zinc-800" aria-label="새 후보"><PlusIcon className="h-4 w-4" /></button>
                 </div>
                 <div className="space-y-3">
-                  {candidates.length ? candidates.map((candidate) => (
+                  {sortedCandidates.length ? sortedCandidates.map((candidate) => (
                     <CandidateCard key={candidate.id} candidate={candidate} active={activeCandidateId === candidate.id} onOpen={() => setActiveCandidateId(candidate.id)} onDelete={() => deleteCandidate(candidate.id)} />
                   )) : <EmptyState title="후보가 없습니다" description="탐색 탭에서 여러 신호를 선택해 하나의 문제 클러스터로 묶거나 새 후보를 직접 만드세요." />}
                 </div>
@@ -1099,9 +1113,9 @@ export function ResearchWorkbench() {
           {tab === "prompt" ? (
             <div className="grid gap-5 xl:grid-cols-[320px_minmax(0,1fr)]">
               <section>
-                <SectionTitle eyebrow="Final Gate" title="프롬프트 대상 선택" description="60점 미만 후보는 원칙적으로 글을 생성하지 않고 무엇이 부족한지만 확인합니다." />
+                <SectionTitle eyebrow="Final Gate" title="ChatGPT용 자동 작성 후보" description="점수가 높은 순서로 정렬됩니다. 후보 하나만 고르면 ChatGPT가 콘텐츠 방식·구조·근거·고유 결과물을 다시 판단하고, 약한 주제는 스스로 보류하도록 설계했습니다." />
                 <div className="space-y-2">
-                  {candidates.length ? candidates.map((candidate) => (
+                  {sortedCandidates.length ? sortedCandidates.map((candidate) => (
                     <button key={candidate.id} type="button" onClick={() => setActiveCandidateId(candidate.id)} className={classNames("w-full rounded-2xl border p-4 text-left transition", activeCandidateId === candidate.id ? "border-zinc-900 bg-white" : "border-zinc-200 bg-white hover:border-zinc-300")}> 
                       <div className="flex items-center justify-between gap-3">
                         <span className="line-clamp-2 text-sm font-medium text-zinc-800">{candidate.title || "제목 없는 후보"}</span>
@@ -1121,14 +1135,14 @@ export function ResearchWorkbench() {
                           <Badge tone={verdict(scoreCandidate(activeCandidate)).tone}>{verdict(scoreCandidate(activeCandidate)).label}</Badge>
                           <Badge>{scoreCandidate(activeCandidate)}점</Badge>
                         </div>
-                        <h2 className="text-xl font-semibold tracking-[-0.02em]">증거 기반 콘텐츠 제작 프롬프트</h2>
-                        <p className="mt-1 text-sm leading-6 text-zinc-500">직접 경험을 꾸며내지 않고 웹 조사를 비교·검증 결과물로 바꾸도록 설계되어 있습니다.</p>
+                        <h2 className="text-xl font-semibold tracking-[-0.02em]">ChatGPT 자동 판단·작성 프롬프트</h2>
+                        <p className="mt-1 text-sm leading-6 text-zinc-500">추가 선택 없이 후보와 조사 신호를 바탕으로 게시 여부부터 글 구조까지 모델이 직접 결정합니다. AdSense 승인을 보장할 수는 없지만 저가치·대량생산형 콘텐츠 위험을 줄이는 기준을 강하게 적용합니다.</p>
                       </div>
-                      <button type="button" onClick={() => void copyPrompt()} className="inline-flex items-center gap-2 rounded-xl bg-zinc-900 px-4 py-2.5 text-xs font-medium text-white hover:bg-zinc-800">{promptCopied ? <CheckIcon className="h-4 w-4" /> : <CopyIcon className="h-4 w-4" />} {promptCopied ? "복사됨" : "프롬프트 복사"}</button>
+                      <button type="button" onClick={() => void copyPrompt()} className="inline-flex items-center gap-2 rounded-xl bg-zinc-900 px-4 py-2.5 text-xs font-medium text-white hover:bg-zinc-800">{promptCopied ? <CheckIcon className="h-4 w-4" /> : <CopyIcon className="h-4 w-4" />} {promptCopied ? "복사됨" : "ChatGPT용 프롬프트 복사"}</button>
                     </div>
                     {scoreCandidate(activeCandidate) < 60 ? (
                       <div className="mb-4 rounded-2xl border border-rose-200 bg-rose-50 p-4 text-sm leading-6 text-rose-700">
-                        현재 후보는 60점 미만입니다. 프롬프트도 먼저 “게시 보류”를 판단하도록 되어 있으므로, 고유 결과물·공식 근거·문제 구체성을 보강한 뒤 제작하는 편이 좋습니다.
+                        현재 후보는 60점 미만입니다. ChatGPT가 웹 조사로 보완 가능성을 다시 확인하되, 공식 근거와 고유 결과물을 확보하지 못하면 글을 작성하지 않고 보류하도록 되어 있습니다.
                       </div>
                     ) : null}
                     <pre className="max-h-[720px] overflow-auto whitespace-pre-wrap rounded-2xl bg-zinc-950 p-5 text-xs leading-6 text-zinc-200 scrollbar-thin">{activePrompt}</pre>
@@ -1161,6 +1175,7 @@ function CandidateEditor({
   const score = scoreCandidate(candidate);
   const result = verdict(score);
   const linkedSignals = signals.filter((signal) => candidate.sourceSignalIds.includes(signal.id));
+  const activePenalties = PENALTY_FIELDS.filter((field) => candidate.penalties[field.key]);
 
   return (
     <div className="space-y-5">
@@ -1169,24 +1184,109 @@ function CandidateEditor({
           <div className="min-w-0 flex-1">
             <div className="mb-2 flex flex-wrap gap-2">
               <Badge tone={result.tone}>{result.label}</Badge>
-              <Badge>{CONTENT_MODE_LABELS[candidate.contentMode]}</Badge>
+              <Badge>{CONTENT_MODE_LABELS[candidate.contentMode]} · 자동 추정</Badge>
             </div>
-            <input value={candidate.title} onChange={(event) => onChange({ title: event.target.value })} placeholder="주제 제목" className="w-full border-0 bg-transparent p-0 text-2xl font-semibold tracking-[-0.04em] outline-none placeholder:text-zinc-300" />
+            <h2 className="text-2xl font-semibold tracking-[-0.04em] text-zinc-900">{candidate.title || "제목 없는 후보"}</h2>
+            <p className="mt-2 max-w-3xl text-sm leading-6 text-zinc-500">{candidate.problem || "자동 탐색 신호를 바탕으로 해결하려는 문제를 다시 판단합니다."}</p>
           </div>
           <ScoreRing score={score} />
         </div>
+
+        <div className="mt-5 grid gap-3 md:grid-cols-3">
+          <div className="rounded-2xl bg-zinc-50 p-4">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">대상 독자</div>
+            <p className="mt-2 text-xs leading-5 text-zinc-600">{candidate.audience || "ChatGPT가 문제와 검색 의도를 보고 자동 결정"}</p>
+          </div>
+          <div className="rounded-2xl bg-zinc-50 p-4">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">사이트 방향</div>
+            <p className="mt-2 text-xs leading-5 text-zinc-600">{candidate.siteTheme || "생활 문제 해결 · 디지털 생활"}</p>
+          </div>
+          <div className="rounded-2xl bg-zinc-50 p-4">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">연결 근거</div>
+            <p className="mt-2 text-xs leading-5 text-zinc-600">조사 신호 {linkedSignals.length}개 · 공식 근거 {linkedSignals.filter((signal) => signal.kind === "official").length}개</p>
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={onOpenPrompt}
+          className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-zinc-900 px-4 py-3 text-sm font-semibold text-white hover:bg-zinc-800 sm:w-auto"
+        >
+          <FileTextIcon className="h-4 w-4" /> ChatGPT 자동 작성 프롬프트 보기
+        </button>
+      </section>
+
+      <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+        <SectionTitle
+          eyebrow="Auto Quality Gate"
+          title="게시 가치 평가는 앱이 먼저 판단"
+          description="슬라이더를 직접 맞출 필요가 없습니다. 자동 탐색에서 수요·문제성·공식 근거·고유성·지속성을 계산하고, ChatGPT 프롬프트가 웹 조사 후 한 번 더 최종 판단합니다."
+        />
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          {SCORE_FIELDS.map((field) => (
+            <div key={field.key} className="rounded-2xl border border-zinc-200 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-sm font-medium text-zinc-700">{field.label}</div>
+                <div className="rounded-lg bg-zinc-100 px-2 py-1 text-xs font-semibold text-zinc-700">{candidate.scoreInputs[field.key]}/5</div>
+              </div>
+              <div className="mt-1 text-[11px] leading-4 text-zinc-400">{field.hint}</div>
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-5 border-t border-zinc-100 pt-5">
+          <div className="text-xs font-semibold text-zinc-700">자동 감점 진단</div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {activePenalties.length ? activePenalties.map((field) => <Badge key={field.key} tone="bad">{field.label}</Badge>) : <Badge tone="good">감점 요인 없음</Badge>}
+          </div>
+          <p className="mt-2 text-[11px] leading-5 text-zinc-400">이 점수는 사전 필터입니다. 최종 프롬프트에서는 최신 공식 자료를 다시 확인하고 필요하면 사전 판단을 뒤집도록 지시합니다.</p>
+        </div>
+      </section>
+
+      <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+        <SectionTitle eyebrow="Original Value" title="고유 결과물과 검증 방식도 자동 설계" description="일반적인 SEO 글이 아니라 비교표·판단 흐름·체크리스트·공식자료 대조처럼 실제 추가 가치를 만드는 방향으로 설계합니다." />
+        <div className="grid gap-3 lg:grid-cols-2">
+          <div className="rounded-2xl bg-zinc-50 p-4">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">고유 결과물</div>
+            <p className="mt-2 text-sm leading-6 text-zinc-700">{candidate.uniqueOutput || "ChatGPT가 조사 결과를 보고 가장 강한 고유 결과물을 직접 결정"}</p>
+          </div>
+          <div className="rounded-2xl bg-zinc-50 p-4">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">검증 계획</div>
+            <p className="mt-2 text-sm leading-6 text-zinc-700">{candidate.verificationPlan || "공식 원문을 우선 확인하고 공개 사례는 문제 발견 용도로만 사용"}</p>
+          </div>
+        </div>
+        {candidate.directEvidence ? (
+          <div className="mt-3 rounded-2xl border border-zinc-200 p-4">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">직접 확보한 증거</div>
+            <p className="mt-2 text-sm leading-6 text-zinc-700">{candidate.directEvidence}</p>
+          </div>
+        ) : null}
+      </section>
+
+      <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <SectionTitle eyebrow="Evidence Set" title={`연결된 조사 신호 ${linkedSignals.length}개`} description="사용자가 별도로 고를 필요는 없습니다. 자동 탐색이 연결한 신호를 ChatGPT가 참고하고, 부족한 근거는 웹 검색으로 추가 확인하도록 프롬프트에 포함합니다." />
+        </div>
+        {linkedSignals.length ? (
+          <div className="grid gap-2 md:grid-cols-2">
+            {linkedSignals.map((signal) => (
+              <div key={signal.id} className="rounded-xl border border-zinc-200 p-3">
+                <div className="mb-1 flex gap-2"><Badge>{SIGNAL_LABELS[signal.kind]}</Badge></div>
+                <div className="text-xs font-medium leading-5 text-zinc-700">{signal.title}</div>
+              </div>
+            ))}
+          </div>
+        ) : <p className="text-sm text-zinc-400">연결된 신호가 없습니다. 자동 탐색을 먼저 실행하는 것을 권장합니다.</p>}
+      </section>
+
+      <details className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+        <summary className="cursor-pointer list-none text-sm font-semibold text-zinc-700">고급 설정 · 자동 판단을 직접 수정할 때만 열기</summary>
+        <p className="mt-2 text-xs leading-5 text-zinc-400">일반 사용에서는 건드리지 않아도 됩니다. 자동 평가가 명백히 잘못된 경우에만 보정하세요.</p>
+
         <div className="mt-5 grid gap-3 md:grid-cols-2">
           <label className="block">
-            <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">해결하려는 문제</span>
-            <textarea value={candidate.problem} onChange={(event) => onChange({ problem: event.target.value })} rows={3} className="w-full resize-none rounded-xl border border-zinc-200 px-3 py-2.5 text-sm leading-6 outline-none focus:border-zinc-400" placeholder="사용자가 정확히 어디서 막히는가" />
-          </label>
-          <label className="block">
-            <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">대상 독자</span>
-            <textarea value={candidate.audience} onChange={(event) => onChange({ audience: event.target.value })} rows={3} className="w-full resize-none rounded-xl border border-zinc-200 px-3 py-2.5 text-sm leading-6 outline-none focus:border-zinc-400" placeholder="누가 이 글을 필요로 하는가" />
-          </label>
-          <label className="block">
-            <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">사이트 주제</span>
-            <input value={candidate.siteTheme} onChange={(event) => onChange({ siteTheme: event.target.value })} className="w-full rounded-xl border border-zinc-200 px-3 py-2.5 text-sm outline-none focus:border-zinc-400" />
+            <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">주제 제목</span>
+            <input value={candidate.title} onChange={(event) => onChange({ title: event.target.value })} className="w-full rounded-xl border border-zinc-200 px-3 py-2.5 text-sm outline-none focus:border-zinc-400" />
           </label>
           <label className="block">
             <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">콘텐츠 방식</span>
@@ -1194,12 +1294,33 @@ function CandidateEditor({
               {(Object.keys(CONTENT_MODE_LABELS) as ContentMode[]).map((mode) => <option key={mode} value={mode}>{CONTENT_MODE_LABELS[mode]}</option>)}
             </select>
           </label>
+          <label className="block md:col-span-2">
+            <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">해결하려는 문제</span>
+            <textarea value={candidate.problem} onChange={(event) => onChange({ problem: event.target.value })} rows={2} className="w-full resize-none rounded-xl border border-zinc-200 px-3 py-2.5 text-sm leading-6 outline-none focus:border-zinc-400" />
+          </label>
+          <label className="block">
+            <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">대상 독자</span>
+            <textarea value={candidate.audience} onChange={(event) => onChange({ audience: event.target.value })} rows={2} className="w-full resize-none rounded-xl border border-zinc-200 px-3 py-2.5 text-sm leading-6 outline-none focus:border-zinc-400" />
+          </label>
+          <label className="block">
+            <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">사이트 주제</span>
+            <input value={candidate.siteTheme} onChange={(event) => onChange({ siteTheme: event.target.value })} className="w-full rounded-xl border border-zinc-200 px-3 py-2.5 text-sm outline-none focus:border-zinc-400" />
+          </label>
+          <label className="block md:col-span-2">
+            <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">고유 결과물</span>
+            <textarea value={candidate.uniqueOutput} onChange={(event) => onChange({ uniqueOutput: event.target.value })} rows={2} className="w-full resize-none rounded-xl border border-zinc-200 px-3 py-2.5 text-sm leading-6 outline-none focus:border-zinc-400" />
+          </label>
+          <label className="block md:col-span-2">
+            <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">검증 계획</span>
+            <textarea value={candidate.verificationPlan} onChange={(event) => onChange({ verificationPlan: event.target.value })} rows={2} className="w-full resize-none rounded-xl border border-zinc-200 px-3 py-2.5 text-sm leading-6 outline-none focus:border-zinc-400" />
+          </label>
+          <label className="block md:col-span-2">
+            <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">직접 확보한 증거</span>
+            <textarea value={candidate.directEvidence} onChange={(event) => onChange({ directEvidence: event.target.value })} rows={2} className="w-full resize-none rounded-xl border border-zinc-200 px-3 py-2.5 text-sm leading-6 outline-none focus:border-zinc-400" />
+          </label>
         </div>
-      </section>
 
-      <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
-        <SectionTitle eyebrow="Quality Score" title="게시 가치 평가" description="검색량 하나가 아니라 사이트 적합성·문제 구체성·공식 근거·고유 결과물을 함께 봅니다. 60점 미만이면 제작을 보류합니다." />
-        <div className="space-y-5">
+        <div className="mt-6 space-y-5 border-t border-zinc-100 pt-5">
           {SCORE_FIELDS.map((field) => (
             <div key={field.key} className="grid gap-2 sm:grid-cols-[210px_minmax(0,1fr)_34px] sm:items-center">
               <div>
@@ -1213,10 +1334,10 @@ function CandidateEditor({
         </div>
 
         <div className="mt-6 border-t border-zinc-100 pt-5">
-          <div className="mb-3 text-xs font-semibold text-zinc-700">감점 요인</div>
+          <div className="mb-3 text-xs font-semibold text-zinc-700">감점 요인 직접 수정</div>
           <div className="grid gap-2 md:grid-cols-2">
             {PENALTY_FIELDS.map((field) => (
-              <label key={field.key} className={classNames("flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition", candidate.penalties[field.key] ? "border-rose-200 bg-rose-50" : "border-zinc-200 bg-white")}> 
+              <label key={field.key} className={classNames("flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition", candidate.penalties[field.key] ? "border-rose-200 bg-rose-50" : "border-zinc-200 bg-white")}>
                 <input type="checkbox" checked={candidate.penalties[field.key]} onChange={(event) => onPenalty(field.key, event.target.checked)} className="mt-0.5 h-4 w-4 accent-zinc-900" />
                 <span>
                   <span className="block text-xs font-medium text-zinc-700">{field.label}</span>
@@ -1226,42 +1347,7 @@ function CandidateEditor({
             ))}
           </div>
         </div>
-      </section>
-
-      <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
-        <SectionTitle eyebrow="Original Value" title="‘이 사이트에서만 얻는 결과물’을 먼저 설계" description="검색 결과를 보기 좋게 다시 쓰는 것으로는 부족합니다. 글을 쓰기 전에 비교표·판단 흐름·체크리스트·직접 데이터·도구 중 무엇을 새로 만들지 정하세요." />
-        <div className="space-y-3">
-          <label className="block">
-            <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">고유 결과물</span>
-            <textarea value={candidate.uniqueOutput} onChange={(event) => onChange({ uniqueOutput: event.target.value })} rows={3} placeholder="예: 6개 제조사의 필터 물세척 기준을 공식 매뉴얼로 비교한 표" className="w-full resize-none rounded-xl border border-zinc-200 px-3 py-3 text-sm leading-6 outline-none placeholder:text-zinc-300 focus:border-zinc-400" />
-          </label>
-          <label className="block">
-            <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">검증 계획</span>
-            <textarea value={candidate.verificationPlan} onChange={(event) => onChange({ verificationPlan: event.target.value })} rows={3} placeholder="어떤 공식 원문으로 사실을 확인하고, 커뮤니티 사례는 무엇을 찾는 데만 쓸지" className="w-full resize-none rounded-xl border border-zinc-200 px-3 py-3 text-sm leading-6 outline-none placeholder:text-zinc-300 focus:border-zinc-400" />
-          </label>
-          <label className="block">
-            <span className="mb-1.5 block text-[11px] font-medium text-zinc-500">직접 확보한 증거 (없으면 비워도 됨)</span>
-            <textarea value={candidate.directEvidence} onChange={(event) => onChange({ directEvidence: event.target.value })} rows={2} placeholder="직접 찍은 사진, 사용 모델, 실제 비용, 직접 처리한 날짜 등. 없으면 경험을 꾸며내지 않습니다." className="w-full resize-none rounded-xl border border-zinc-200 px-3 py-3 text-sm leading-6 outline-none placeholder:text-zinc-300 focus:border-zinc-400" />
-          </label>
-        </div>
-      </section>
-
-      <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <SectionTitle eyebrow="Evidence Set" title={`연결된 조사 신호 ${linkedSignals.length}개`} description="트렌드·불편·공식 근거가 한쪽으로 치우치지 않았는지 확인하세요." />
-          <button type="button" onClick={onOpenPrompt} className="mb-5 inline-flex items-center gap-2 rounded-xl bg-zinc-900 px-4 py-2.5 text-xs font-medium text-white hover:bg-zinc-800"><FileTextIcon className="h-4 w-4" /> 제작 프롬프트 보기</button>
-        </div>
-        {linkedSignals.length ? (
-          <div className="grid gap-2 md:grid-cols-2">
-            {linkedSignals.map((signal) => (
-              <div key={signal.id} className="rounded-xl border border-zinc-200 p-3">
-                <div className="mb-1 flex gap-2"><Badge>{SIGNAL_LABELS[signal.kind]}</Badge></div>
-                <div className="text-xs font-medium leading-5 text-zinc-700">{signal.title}</div>
-              </div>
-            ))}
-          </div>
-        ) : <p className="text-sm text-zinc-400">연결된 신호가 없습니다. 탐색 탭에서 신호를 묶어 새 후보를 만드는 것을 권장합니다.</p>}
-      </section>
+      </details>
     </div>
   );
 }
