@@ -1,36 +1,78 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# content-topic-research-web
 
-## Getting Started
+네이버 검색·NAVER 검색어트렌드·Google Trends·Search Console·뉴스·커뮤니티·공식자료에서 얻은 신호를 한곳에 모아, **검색량이 아니라 게시 가치**를 기준으로 콘텐츠 주제를 선별하는 Next.js 도구입니다.
 
-First, run the development server:
+## 핵심 원칙
+
+- 네이버 검색 API: 키워드 생산기가 아니라 **사용자가 실제로 묻는 문제 탐지기**로 사용
+- NAVER 검색어트렌드 / Google Trends: WHAT보다 **WHEN(수요·발행 시기)** 판단에 사용
+- 네이버 뉴스: 기사 재작성보다 **변경 감지**에 사용
+- Search Console: 내 사이트가 이미 노출되는 **실제 기회**를 우선 발견
+- 카페·지식iN·커뮤니티: 사실 근거가 아니라 **불편·질문 표현** 탐색
+- 공식기관·제조사 자료: **사실 검증**에 사용
+- 같은 검색 의도는 한 페이지로 클러스터링
+- 웹서핑한 내용을 직접 체험한 것처럼 쓰지 않음
+- 60점 미만 후보는 자동으로 “제작 보류” 상태로 판단
+
+## 실행
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## NAVER API HUB 설정
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+이 프로젝트는 2026년 NAVER API HUB 기준으로 다음 Application API를 사용합니다.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- 검색어트렌드
+- 뉴스
+- 블로그
+- 지식iN
+- 카페
+- 웹문서
 
-## Learn More
+NAVER Cloud Platform의 **NAVER API HUB > Application > 인증 정보**에서 Client ID와 Client Secret을 확인한 뒤 프로젝트 루트에 `.env.local`을 만듭니다.
 
-To learn more about Next.js, take a look at the following resources:
+```env
+NAVER_API_HUB_CLIENT_ID=...
+NAVER_API_HUB_CLIENT_SECRET=...
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+기존 NAVER Developers의 `X-Naver-Client-Id` / `X-Naver-Client-Secret` 방식이 아니라 NAVER API HUB의 다음 인증 헤더와 엔드포인트를 사용합니다.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+- API 도메인: `https://naverapihub.apigw.ntruss.com`
+- Client ID 헤더: `X-NCP-APIGW-API-KEY-ID`
+- Client Secret 헤더: `X-NCP-APIGW-API-KEY`
+- 검색: `/search/v1/*`
+- 검색어트렌드: `/search-trend/v1/search`
 
-## Deploy on Vercel
+> Client ID와 Client Secret은 브라우저 코드에 넣지 않습니다. Next.js Route Handler에서만 읽도록 구성되어 있습니다.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## NAVER 검색어트렌드 사용 방식
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+앱에서 최대 5개 키워드를 비교할 수 있습니다. API가 반환하는 `ratio` 값은 절대 검색량이 아니라 요청한 기간·검색어 집합 안에서 정규화된 상대 지수이므로, **주제 결정용 절대 검색량이 아니라 수요·계절성·발행 시기 신호**로만 사용합니다.
+
+- 최근 90일: 주간 단위
+- 최근 1년: 월간 단위
+- 저장 시 최근 4개 구간의 평균 상대지수를 `trendScore`로 기록
+
+## 데이터 보관
+
+현재 버전은 개인용 리서치 도구를 전제로 브라우저 `localStorage`에 신호와 후보를 저장합니다. 서버 DB가 필요하면 Supabase/Firebase/Postgres 등으로 저장 레이어만 교체할 수 있습니다.
+
+## Search Console 가져오기
+
+Performance 화면에서 CSV를 내보낸 뒤 앱의 `Search Console CSV` 영역에서 업로드합니다. 다음과 같은 헤더를 자동 인식합니다.
+
+- Query / 검색어 / 쿼리
+- Clicks / 클릭수
+- Impressions / 노출수
+- CTR
+- Position / 게재순위 / 평균 게재순위
+
+## 빌드
+
+```bash
+npm run build
+```
