@@ -59,6 +59,20 @@ type NaverTrendResult = {
   data: NaverTrendPoint[];
 };
 
+type AutoResearchSeedSummary = {
+  query: string;
+  category: string;
+};
+
+type AutoResearchResponse = {
+  generatedAt: string;
+  offset: number;
+  seeds: AutoResearchSeedSummary[];
+  signals: Signal[];
+  candidates: Candidate[];
+  errors?: string[];
+};
+
 const STORAGE_SIGNALS = "content-topic-research:signals:v1";
 const STORAGE_CANDIDATES = "content-topic-research:candidates:v1";
 
@@ -314,6 +328,12 @@ export function ResearchWorkbench() {
   const [naverTrendLoading, setNaverTrendLoading] = useState(false);
   const [naverTrendError, setNaverTrendError] = useState<string | null>(null);
 
+  const [autoResearchLoading, setAutoResearchLoading] = useState(false);
+  const [autoResearchError, setAutoResearchError] = useState<string | null>(null);
+  const [autoResearchOffset, setAutoResearchOffset] = useState(0);
+  const [autoResearchSeeds, setAutoResearchSeeds] = useState<AutoResearchSeedSummary[]>([]);
+  const [autoResearchWarnings, setAutoResearchWarnings] = useState<string[]>([]);
+
   const [manualKind, setManualKind] = useState<SignalKind>("official");
   const [manualTitle, setManualTitle] = useState("");
   const [manualUrl, setManualUrl] = useState("");
@@ -380,6 +400,10 @@ export function ResearchWorkbench() {
     setSelectedSignalIds([]);
     setActiveCandidateId(null);
     setNaverItems([]);
+    setAutoResearchSeeds([]);
+    setAutoResearchWarnings([]);
+    setAutoResearchError(null);
+    setAutoResearchOffset(0);
     window.localStorage.removeItem(STORAGE_SIGNALS);
     window.localStorage.removeItem(STORAGE_CANDIDATES);
     setToast("로컬 데이터를 초기화했습니다.");
@@ -418,6 +442,70 @@ export function ResearchWorkbench() {
     setManualTitle("");
     setManualUrl("");
     setManualNote("");
+  }
+
+  async function runAutoResearch(offset = 0) {
+    setAutoResearchLoading(true);
+    setAutoResearchError(null);
+    setAutoResearchWarnings([]);
+
+    try {
+      const response = await fetch("/api/research/auto", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ offset }),
+      });
+      const data = (await response.json()) as AutoResearchResponse & { error?: string };
+
+      if (!response.ok) {
+        throw new Error(data.error || "자동 탐색에 실패했습니다.");
+      }
+
+      const incomingSignals = Array.isArray(data.signals) ? data.signals : [];
+      const incomingCandidates = Array.isArray(data.candidates) ? data.candidates : [];
+      const signalIdMap = new Map<string, string>();
+      const existingByKey = new Map(
+        signals.map((signal) => [
+          `${signal.kind}::${signal.title}::${signal.url || ""}`,
+          signal.id,
+        ]),
+      );
+      const freshSignals: Signal[] = [];
+
+      incomingSignals.forEach((signal) => {
+        const key = `${signal.kind}::${signal.title}::${signal.url || ""}`;
+        const existingId = existingByKey.get(key);
+        if (existingId) {
+          signalIdMap.set(signal.id, existingId);
+          return;
+        }
+        existingByKey.set(key, signal.id);
+        signalIdMap.set(signal.id, signal.id);
+        freshSignals.push(signal);
+      });
+
+      const normalizedCandidates = incomingCandidates.map((candidate) => ({
+        ...candidate,
+        sourceSignalIds: candidate.sourceSignalIds.map((id) => signalIdMap.get(id) || id),
+      }));
+
+      setSignals((current) => [...freshSignals, ...current]);
+
+      setCandidates((current) => {
+        const incomingTitles = new Set(normalizedCandidates.map((candidate) => candidate.title));
+        return [...normalizedCandidates, ...current.filter((candidate) => !incomingTitles.has(candidate.title))];
+      });
+
+      setAutoResearchOffset(offset);
+      setAutoResearchSeeds(Array.isArray(data.seeds) ? data.seeds : []);
+      setAutoResearchWarnings(Array.isArray(data.errors) ? data.errors : []);
+      if (normalizedCandidates[0]) setActiveCandidateId(normalizedCandidates[0].id);
+      setToast(`자동 탐색 완료 · 주제 후보 ${normalizedCandidates.length}개를 만들었습니다.`);
+    } catch (error) {
+      setAutoResearchError(error instanceof Error ? error.message : "자동 탐색에 실패했습니다.");
+    } finally {
+      setAutoResearchLoading(false);
+    }
   }
 
   async function searchNaver() {
@@ -733,11 +821,92 @@ export function ResearchWorkbench() {
                 ))}
               </section>
 
+              <section className="overflow-hidden rounded-3xl border border-zinc-900 bg-zinc-950 p-5 text-white sm:p-6">
+                <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_340px] xl:items-end">
+                  <div>
+                    <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">One-click Research</div>
+                    <h2 className="text-2xl font-semibold tracking-[-0.04em]">아무것도 입력하지 말고 오늘의 주제를 자동 탐색</h2>
+                    <p className="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
+                      오늘 날짜와 계절, 생활 문제 해결·디지털 생활이라는 사이트 방향을 기준으로 주제 5개를 먼저 고릅니다. 각 주제마다 지식iN·카페·블로그에서 실제 불편을 찾고, 뉴스에서 변경 신호를 확인하고, 웹문서에서 공식 근거 후보를 찾은 뒤 NAVER 검색어트렌드까지 묶어 주제 후보와 점수를 자동으로 만듭니다.
+                    </p>
+                    <div className="mt-4 flex flex-wrap gap-2 text-[11px] text-zinc-400">
+                      <span className="rounded-full border border-zinc-800 px-2.5 py-1">지식iN · 실제 질문</span>
+                      <span className="rounded-full border border-zinc-800 px-2.5 py-1">카페 · 반복 불편</span>
+                      <span className="rounded-full border border-zinc-800 px-2.5 py-1">블로그 · 표현/사례</span>
+                      <span className="rounded-full border border-zinc-800 px-2.5 py-1">뉴스 · 변경 감지</span>
+                      <span className="rounded-full border border-zinc-800 px-2.5 py-1">웹문서 · 공식 근거 후보</span>
+                      <span className="rounded-full border border-zinc-800 px-2.5 py-1">검색어트렌드 · 수요/시기</span>
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-4">
+                    <div className="text-xs font-medium text-zinc-300">오늘 할 일</div>
+                    <p className="mt-1 text-xs leading-5 text-zinc-500">키워드를 고민하지 않아도 됩니다. 먼저 자동 탐색을 돌리고 78점 이상 후보부터 확인하세요.</p>
+                    <button
+                      type="button"
+                      onClick={() => void runAutoResearch(0)}
+                      disabled={autoResearchLoading}
+                      className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-white px-4 py-3 text-sm font-semibold text-zinc-950 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <SparkIcon className="h-4 w-4" />
+                      {autoResearchLoading ? "네이버 6개 API 조사 중..." : "오늘의 자동 탐색 시작"}
+                    </button>
+                    {autoResearchSeeds.length ? (
+                      <button
+                        type="button"
+                        onClick={() => void runAutoResearch(autoResearchOffset + 1)}
+                        disabled={autoResearchLoading}
+                        className="mt-2 w-full rounded-xl border border-zinc-700 px-4 py-2.5 text-xs font-medium text-zinc-300 transition hover:border-zinc-500 hover:text-white disabled:opacity-50"
+                      >
+                        다른 주제 5개 찾기
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+
+                {autoResearchError ? (
+                  <div className="mt-4 rounded-xl border border-rose-900/60 bg-rose-950/40 px-4 py-3 text-xs leading-5 text-rose-200">
+                    {autoResearchError}
+                  </div>
+                ) : null}
+
+                {autoResearchSeeds.length ? (
+                  <div className="mt-5 border-t border-zinc-800 pt-5">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-xs font-medium text-zinc-300">이번 자동 탐색 주제</div>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {autoResearchSeeds.map((seed) => (
+                            <span key={seed.query} className="rounded-full bg-zinc-800 px-2.5 py-1 text-[11px] text-zinc-300">
+                              {seed.query} · {seed.category}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setTab("candidates")}
+                        className="rounded-xl border border-zinc-700 px-3 py-2 text-xs font-medium text-zinc-200 hover:border-zinc-500"
+                      >
+                        자동 생성된 후보 보기
+                      </button>
+                    </div>
+                    {autoResearchWarnings.length ? (
+                      <details className="mt-4 rounded-xl border border-amber-900/40 bg-amber-950/20 px-4 py-3 text-xs text-amber-200">
+                        <summary className="cursor-pointer font-medium">일부 API 결과를 가져오지 못했습니다 ({autoResearchWarnings.length})</summary>
+                        <ul className="mt-2 space-y-1 text-amber-300/80">
+                          {autoResearchWarnings.map((warning) => <li key={warning}>· {warning}</li>)}
+                        </ul>
+                      </details>
+                    ) : null}
+                  </div>
+                ) : null}
+              </section>
+
               <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
                 <SectionTitle
-                  eyebrow="Signal 01"
-                  title="네이버에서 ‘키워드’보다 ‘막힌 지점’을 찾기"
-                  description="블로그·카페·지식iN은 사실을 베끼는 소스가 아니라 사람들이 어떤 조건에서 막히는지 찾는 문제 탐지기로 사용합니다. 뉴스는 날짜순으로 보며 변경 감지에만 사용하세요."
+                  eyebrow="Manual Search"
+                  title="직접 찾고 싶은 주제가 있을 때만 검색"
+                  description="자동 탐색에서 빠진 주제를 더 조사하고 싶을 때만 사용합니다. 블로그·카페·지식iN은 문제 탐지, 뉴스는 변경 감지, 웹문서는 근거 후보 탐색에 사용합니다."
                 />
                 <div className="grid gap-3 lg:grid-cols-[170px_minmax(0,1fr)_120px_110px]">
                   <select value={naverType} onChange={(event) => setNaverType(event.target.value as NaverType)} className="rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-3 text-sm outline-none focus:border-zinc-400">
