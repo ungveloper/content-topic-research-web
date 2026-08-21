@@ -420,6 +420,57 @@ export function ResearchWorkbench() {
     setToast("로컬 데이터를 초기화했습니다.");
   }
 
+  function hasWorkspaceWork() {
+    return Boolean(
+      signals.length ||
+      candidates.length ||
+      selectedSignalIds.length ||
+      naverQuery.trim() ||
+      naverItems.length ||
+      naverTrendKeywords.trim() ||
+      naverTrendResults.length ||
+      autoResearchSeeds.length ||
+      manualTitle.trim() ||
+      manualUrl.trim() ||
+      manualNote.trim(),
+    );
+  }
+
+  function clearWorkspaceForHome() {
+    setTab("discover");
+    setSignals([]);
+    setCandidates([]);
+    setSelectedSignalIds([]);
+    setActiveCandidateId(null);
+    setNaverQuery("");
+    setNaverItems([]);
+    setNaverError(null);
+    setNaverTrendKeywords("");
+    setNaverTrendResults([]);
+    setNaverTrendError(null);
+    setAutoResearchSeeds([]);
+    setAutoResearchWarnings([]);
+    setAutoResearchError(null);
+    setAutoResearchOffset(0);
+    setManualTitle("");
+    setManualUrl("");
+    setManualNote("");
+    window.localStorage.removeItem(STORAGE_SIGNALS);
+    window.localStorage.removeItem(STORAGE_CANDIDATES);
+  }
+
+  function handleBrandHome() {
+    if (hasWorkspaceWork()) {
+      const confirmed = window.confirm(
+        "현재 입력하거나 작업 중인 내용이 있습니다. 홈으로 이동하면 작업 내용을 잃을 수 있습니다. 계속할까요?",
+      );
+      if (!confirmed) return;
+    }
+
+    clearWorkspaceForHome();
+    window.location.assign("/");
+  }
+
   function addSignal(signal: Signal) {
     const duplicate = signals.some(
       (item) => item.kind === signal.kind && item.title === signal.title && item.url === signal.url,
@@ -512,7 +563,9 @@ export function ResearchWorkbench() {
       setAutoResearchWarnings(Array.isArray(data.errors) ? data.errors : []);
       const topIncoming = [...normalizedCandidates].sort((a, b) => scoreCandidate(b) - scoreCandidate(a))[0];
       if (topIncoming) setActiveCandidateId(topIncoming.id);
+      setTab("candidates");
       setToast(`자동 탐색 완료 · 주제 후보 ${normalizedCandidates.length}개를 만들었습니다.`);
+      window.setTimeout(() => window.scrollTo({ top: 0, left: 0, behavior: "auto" }), 0);
     } catch (error) {
       setAutoResearchError(error instanceof Error ? error.message : "자동 탐색에 실패했습니다.");
     } finally {
@@ -780,7 +833,12 @@ export function ResearchWorkbench() {
 
       <header className="sticky top-0 z-40 border-b border-zinc-200/80 bg-[#f7f7f5]/95 backdrop-blur">
         <div className="mx-auto flex h-16 max-w-[1500px] items-center justify-between px-4 sm:px-6">
-          <div className="flex min-w-0 items-center gap-3">
+          <button
+            type="button"
+            onClick={handleBrandHome}
+            className="flex min-w-0 items-center gap-3 rounded-xl text-left outline-none transition hover:opacity-80 focus-visible:ring-2 focus-visible:ring-zinc-400 focus-visible:ring-offset-2"
+            aria-label="홈으로 이동하고 작업 초기화"
+          >
             <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-zinc-900 text-white">
               <SparkIcon className="h-4 w-4" />
             </div>
@@ -788,7 +846,7 @@ export function ResearchWorkbench() {
               <div className="truncate text-sm font-semibold tracking-[-0.02em]">Content Topic Research</div>
               <div className="hidden text-[11px] text-zinc-400 sm:block">생산 자동화보다 선별 자동화</div>
             </div>
-          </div>
+          </button>
           <div className="flex items-center gap-2">
             <button type="button" onClick={loadSample} className="hidden rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-50 sm:block">샘플 불러오기</button>
             <button type="button" onClick={resetAll} className="rounded-lg px-3 py-2 text-xs font-medium text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700">초기화</button>
@@ -839,7 +897,7 @@ export function ResearchWorkbench() {
         <main className="min-w-0">
           {tab === "discover" ? (
             <div className="space-y-6">
-              <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              <section className="grid grid-cols-2 gap-3 xl:grid-cols-4">
                 {[
                   ["수집 신호", signals.length, "수요·불편·근거"],
                   ["주제 후보", candidates.length, "평가 대기 포함"],
@@ -915,13 +973,7 @@ export function ResearchWorkbench() {
                           ))}
                         </div>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => setTab("candidates")}
-                        className="rounded-xl border border-zinc-700 px-3 py-2 text-xs font-medium text-zinc-200 hover:border-zinc-500"
-                      >
-                        자동 생성된 후보 보기
-                      </button>
+
                     </div>
                     {autoResearchWarnings.length ? (
                       <details className="mt-4 rounded-xl border border-amber-900/40 bg-amber-950/20 px-4 py-3 text-xs text-amber-200">
@@ -1219,7 +1271,7 @@ function CandidateEditor({
           </div>
           <div className="rounded-2xl bg-zinc-50 p-4">
             <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">사이트 방향</div>
-            <p className="mt-2 text-xs leading-5 text-zinc-600">{candidate.siteTheme || "생활 문제 해결 · 디지털 생활"}</p>
+            <p className="mt-2 text-xs leading-5 text-zinc-600">{candidate.siteTheme || "생활 문제 해결 기록소 · 디지털 생활 도구"}</p>
           </div>
           <div className="rounded-2xl bg-zinc-50 p-4">
             <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">연결 근거</div>

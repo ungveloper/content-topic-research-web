@@ -294,7 +294,7 @@ export async function POST(request: NextRequest) {
       title: seed.query,
       problem: problemSignal?.title || `${seed.query}와 관련해 사용자가 실제로 막히는 조건과 확인 순서를 찾는다.`,
       audience: seed.audience,
-      siteTheme: "생활 문제 해결 · 디지털 생활",
+      siteTheme: "생활 문제 해결 기록소 · 디지털 생활 도구",
       contentMode: seed.contentMode,
       sourceSignalIds: seedSignals.map((signal) => signal.id),
       scoreInputs: {
