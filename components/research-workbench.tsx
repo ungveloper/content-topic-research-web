@@ -740,13 +740,32 @@ export function ResearchWorkbench() {
     if (activeCandidateId === id) setActiveCandidateId(null);
   }
 
+  async function copyCandidatePrompt(candidate: Candidate) {
+    const text = candidatePrompt(candidate, signals);
+    setActiveCandidateId(candidate.id);
+
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      document.execCommand("copy");
+      textarea.remove();
+    }
+
+    setPromptCopied(true);
+    setToast(`“${candidate.title || "제목 없는 후보"}” ChatGPT 프롬프트를 복사했습니다.`);
+    window.setTimeout(() => setPromptCopied(false), 1500);
+  }
+
   async function copyPrompt() {
     if (!activeCandidate) return;
-    const text = candidatePrompt(activeCandidate, signals);
-    await navigator.clipboard.writeText(text);
-    setPromptCopied(true);
-    setToast("콘텐츠 제작 프롬프트를 복사했습니다.");
-    window.setTimeout(() => setPromptCopied(false), 1500);
+    await copyCandidatePrompt(activeCandidate);
   }
 
   const activePrompt = activeCandidate ? candidatePrompt(activeCandidate, signals) : "";
@@ -1083,12 +1102,13 @@ export function ResearchWorkbench() {
                   <div>
                     <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-400">Topic Queue</div>
                     <h2 className="mt-1 text-xl font-semibold tracking-[-0.02em]">주제 후보</h2>
+                    <p className="mt-1 text-[11px] text-zinc-400">후보를 누르면 선택과 동시에 ChatGPT 프롬프트가 복사됩니다.</p>
                   </div>
                   <button type="button" onClick={createBlankCandidate} className="flex h-9 w-9 items-center justify-center rounded-xl bg-zinc-900 text-white hover:bg-zinc-800" aria-label="새 후보"><PlusIcon className="h-4 w-4" /></button>
                 </div>
                 <div className="space-y-3">
                   {sortedCandidates.length ? sortedCandidates.map((candidate) => (
-                    <CandidateCard key={candidate.id} candidate={candidate} active={activeCandidateId === candidate.id} onOpen={() => setActiveCandidateId(candidate.id)} onDelete={() => deleteCandidate(candidate.id)} />
+                    <CandidateCard key={candidate.id} candidate={candidate} active={activeCandidateId === candidate.id} onOpen={() => void copyCandidatePrompt(candidate)} onDelete={() => deleteCandidate(candidate.id)} />
                   )) : <EmptyState title="후보가 없습니다" description="탐색 탭에서 여러 신호를 선택해 하나의 문제 클러스터로 묶거나 새 후보를 직접 만드세요." />}
                 </div>
               </section>
@@ -1101,7 +1121,7 @@ export function ResearchWorkbench() {
                     onChange={(patch) => updateCandidate(activeCandidate.id, patch)}
                     onScore={(key, value) => updateScore(activeCandidate.id, key, value)}
                     onPenalty={(key, value) => updatePenalty(activeCandidate.id, key, value)}
-                    onOpenPrompt={() => setTab("prompt")}
+                    onCopyPrompt={() => void copyCandidatePrompt(activeCandidate)}
                   />
                 ) : (
                   <div className="sticky top-20"><EmptyState title="검토할 후보를 선택하세요" description="왼쪽 목록에서 후보를 선택하면 게시 가치 점수, 감점 요인, 고유 결과물과 검증 계획을 편집할 수 있습니다." /></div>
@@ -1116,7 +1136,7 @@ export function ResearchWorkbench() {
                 <SectionTitle eyebrow="Final Gate" title="ChatGPT용 자동 작성 후보" description="점수가 높은 순서로 정렬됩니다. 후보 하나만 고르면 ChatGPT가 콘텐츠 방식·구조·근거·고유 결과물을 다시 판단하고, 약한 주제는 스스로 보류하도록 설계했습니다." />
                 <div className="space-y-2">
                   {sortedCandidates.length ? sortedCandidates.map((candidate) => (
-                    <button key={candidate.id} type="button" onClick={() => setActiveCandidateId(candidate.id)} className={classNames("w-full rounded-2xl border p-4 text-left transition", activeCandidateId === candidate.id ? "border-zinc-900 bg-white" : "border-zinc-200 bg-white hover:border-zinc-300")}> 
+                    <button key={candidate.id} type="button" onClick={() => void copyCandidatePrompt(candidate)} className={classNames("w-full rounded-2xl border p-4 text-left transition", activeCandidateId === candidate.id ? "border-zinc-900 bg-white" : "border-zinc-200 bg-white hover:border-zinc-300")}> 
                       <div className="flex items-center justify-between gap-3">
                         <span className="line-clamp-2 text-sm font-medium text-zinc-800">{candidate.title || "제목 없는 후보"}</span>
                         <span className="text-lg font-semibold">{scoreCandidate(candidate)}</span>
@@ -1163,14 +1183,14 @@ function CandidateEditor({
   onChange,
   onScore,
   onPenalty,
-  onOpenPrompt,
+  onCopyPrompt,
 }: {
   candidate: Candidate;
   signals: Signal[];
   onChange: (patch: Partial<Candidate>) => void;
   onScore: (key: keyof ScoreInputs, value: number) => void;
   onPenalty: (key: keyof Penalties, value: boolean) => void;
-  onOpenPrompt: () => void;
+  onCopyPrompt: () => void;
 }) {
   const score = scoreCandidate(candidate);
   const result = verdict(score);
@@ -1209,10 +1229,10 @@ function CandidateEditor({
 
         <button
           type="button"
-          onClick={onOpenPrompt}
+          onClick={onCopyPrompt}
           className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-zinc-900 px-4 py-3 text-sm font-semibold text-white hover:bg-zinc-800 sm:w-auto"
         >
-          <FileTextIcon className="h-4 w-4" /> ChatGPT 자동 작성 프롬프트 보기
+          <CopyIcon className="h-4 w-4" /> ChatGPT 프롬프트 다시 복사
         </button>
       </section>
 
