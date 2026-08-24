@@ -64,6 +64,12 @@ type AutoResearchSeedSummary = {
   category: string;
 };
 
+type UsedTopicHistory = {
+  title: string;
+  problem?: string;
+  usedAt: string;
+};
+
 type AutoResearchResponse = {
   generatedAt: string;
   offset: number;
@@ -71,10 +77,17 @@ type AutoResearchResponse = {
   signals: Signal[];
   candidates: Candidate[];
   errors?: string[];
+  cooldown?: {
+    usedDays: number;
+    seenDays: number;
+    usedCount: number;
+    seenCount: number;
+  };
 };
 
 const STORAGE_SIGNALS = "content-topic-research:signals:v1";
 const STORAGE_CANDIDATES = "content-topic-research:candidates:v1";
+const STORAGE_USED_TOPICS = "content-topic-research:used-topics:v1";
 
 const SCORE_FIELDS: Array<{
   key: keyof ScoreInputs;
@@ -333,6 +346,8 @@ export function ResearchWorkbench() {
   const [autoResearchOffset, setAutoResearchOffset] = useState(0);
   const [autoResearchSeeds, setAutoResearchSeeds] = useState<AutoResearchSeedSummary[]>([]);
   const [autoResearchWarnings, setAutoResearchWarnings] = useState<string[]>([]);
+  const [autoResearchCooldown, setAutoResearchCooldown] = useState<AutoResearchResponse["cooldown"] | null>(null);
+  const [usedTopics, setUsedTopics] = useState<UsedTopicHistory[]>([]);
 
   const [manualKind, setManualKind] = useState<SignalKind>("official");
   const [manualTitle, setManualTitle] = useState("");
@@ -347,8 +362,10 @@ export function ResearchWorkbench() {
     try {
       const storedSignals = window.localStorage.getItem(STORAGE_SIGNALS);
       const storedCandidates = window.localStorage.getItem(STORAGE_CANDIDATES);
+      const storedUsedTopics = window.localStorage.getItem(STORAGE_USED_TOPICS);
       if (storedSignals) setSignals(JSON.parse(storedSignals));
       if (storedCandidates) setCandidates(JSON.parse(storedCandidates));
+      if (storedUsedTopics) setUsedTopics(JSON.parse(storedUsedTopics));
     } catch {
       // 손상된 로컬 데이터가 있어도 앱은 빈 상태로 시작합니다.
     } finally {
@@ -365,6 +382,16 @@ export function ResearchWorkbench() {
     if (!hydrated) return;
     window.localStorage.setItem(STORAGE_CANDIDATES, JSON.stringify(candidates));
   }, [candidates, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    const cutoff = Date.now() - 90 * 86_400_000;
+    const recent = usedTopics.filter((item) => {
+      const time = new Date(item.usedAt).getTime();
+      return Number.isFinite(time) && time >= cutoff;
+    });
+    window.localStorage.setItem(STORAGE_USED_TOPICS, JSON.stringify(recent));
+  }, [usedTopics, hydrated]);
 
   useEffect(() => {
     if (!toast) return;
@@ -413,6 +440,7 @@ export function ResearchWorkbench() {
     setNaverItems([]);
     setAutoResearchSeeds([]);
     setAutoResearchWarnings([]);
+    setAutoResearchCooldown(null);
     setAutoResearchError(null);
     setAutoResearchOffset(0);
     window.localStorage.removeItem(STORAGE_SIGNALS);
@@ -450,6 +478,7 @@ export function ResearchWorkbench() {
     setNaverTrendError(null);
     setAutoResearchSeeds([]);
     setAutoResearchWarnings([]);
+    setAutoResearchCooldown(null);
     setAutoResearchError(null);
     setAutoResearchOffset(0);
     setManualTitle("");
@@ -510,12 +539,25 @@ export function ResearchWorkbench() {
     setAutoResearchLoading(true);
     setAutoResearchError(null);
     setAutoResearchWarnings([]);
+    setAutoResearchCooldown(null);
 
     try {
       const response = await fetch("/api/research/auto", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ offset }),
+        body: JSON.stringify({
+          offset,
+          usedTopics: usedTopics.map((item) => ({
+            title: item.title,
+            problem: item.problem,
+            usedAt: item.usedAt,
+          })),
+          seenTopics: candidates.map((candidate) => ({
+            title: candidate.title,
+            problem: candidate.problem,
+            updatedAt: candidate.updatedAt,
+          })),
+        }),
       });
       const data = (await response.json()) as AutoResearchResponse & { error?: string };
 
@@ -561,6 +603,7 @@ export function ResearchWorkbench() {
       setAutoResearchOffset(offset);
       setAutoResearchSeeds(Array.isArray(data.seeds) ? data.seeds : []);
       setAutoResearchWarnings(Array.isArray(data.errors) ? data.errors : []);
+      setAutoResearchCooldown(data.cooldown || null);
       const topIncoming = [...normalizedCandidates].sort((a, b) => scoreCandidate(b) - scoreCandidate(a))[0];
       if (topIncoming) setActiveCandidateId(topIncoming.id);
       setTab("candidates");
@@ -797,6 +840,16 @@ export function ResearchWorkbench() {
     const text = candidatePrompt(candidate, signals);
     setActiveCandidateId(candidate.id);
 
+    setUsedTopics((current) => {
+      const next: UsedTopicHistory = {
+        title: candidate.title || candidate.problem || "제목 없는 후보",
+        problem: candidate.problem || undefined,
+        usedAt: new Date().toISOString(),
+      };
+      const filtered = current.filter((item) => item.title !== next.title);
+      return [...filtered, next].slice(-120);
+    });
+
     try {
       await navigator.clipboard.writeText(text);
     } catch {
@@ -918,7 +971,7 @@ export function ResearchWorkbench() {
                     <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">One-click Research</div>
                     <h2 className="text-2xl font-semibold tracking-[-0.04em]">아무것도 입력하지 말고 오늘의 주제를 자동 탐색</h2>
                     <p className="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
-                      오늘 날짜와 계절, 생활 문제 해결·디지털 생활이라는 사이트 방향을 기준으로 주제 5개를 먼저 고릅니다. 각 주제마다 지식iN·카페·블로그에서 실제 불편을 찾고, 뉴스에서 변경 신호를 확인하고, 웹문서에서 공식 근거 후보를 찾은 뒤 NAVER 검색어트렌드까지 묶어 주제 후보와 점수를 자동으로 만듭니다.
+                      미리 정해둔 완성 키워드를 돌려 쓰지 않습니다. 집 관리·디지털 생활·생활 행정·정리·계절 생활처럼 넓은 영역에서 지식iN·카페·블로그의 실제 질문을 먼저 수집한 뒤 문제를 클러스터링합니다. 최근 프롬프트로 사용한 주제는 60일, 최근 후보로 본 유사 주제는 14일 동안 제외하고, 같은 기기·같은 문제 유형이 한 번에 몰리지 않도록 5개를 고른 뒤 공식 근거와 검색어트렌드를 다시 확인합니다.
                     </p>
                     <div className="mt-4 flex flex-wrap gap-2 text-[11px] text-zinc-400">
                       <span className="rounded-full border border-zinc-800 px-2.5 py-1">지식iN · 실제 질문</span>
@@ -931,7 +984,10 @@ export function ResearchWorkbench() {
                   </div>
                   <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-4">
                     <div className="text-xs font-medium text-zinc-300">오늘 할 일</div>
-                    <p className="mt-1 text-xs leading-5 text-zinc-500">키워드를 고민하지 않아도 됩니다. 먼저 자동 탐색을 돌리고 78점 이상 후보부터 확인하세요.</p>
+                    <p className="mt-1 text-xs leading-5 text-zinc-500">키워드를 고민하지 않아도 됩니다. 실제 질문에서 새 문제를 발견하고, 최근 사용·노출 주제는 자동으로 제외합니다.</p>
+                    <div className="mt-2 text-[11px] leading-5 text-zinc-500">
+                      최근 프롬프트 사용 {usedTopics.filter((item) => Date.now() - new Date(item.usedAt).getTime() <= 60 * 86_400_000).length}개 · 60일 중복 방지
+                    </div>
                     <button
                       type="button"
                       onClick={() => void runAutoResearch(0)}
@@ -964,7 +1020,7 @@ export function ResearchWorkbench() {
                   <div className="mt-5 border-t border-zinc-800 pt-5">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
-                        <div className="text-xs font-medium text-zinc-300">이번 자동 탐색 주제</div>
+                        <div className="text-xs font-medium text-zinc-300">이번 자동 탐색 범위</div>
                         <div className="mt-2 flex flex-wrap gap-2">
                           {autoResearchSeeds.map((seed) => (
                             <span key={seed.query} className="rounded-full bg-zinc-800 px-2.5 py-1 text-[11px] text-zinc-300">
@@ -972,6 +1028,11 @@ export function ResearchWorkbench() {
                             </span>
                           ))}
                         </div>
+                        {autoResearchCooldown ? (
+                          <p className="mt-2 text-[11px] leading-5 text-zinc-500">
+                            최근 사용 {autoResearchCooldown.usedCount}개는 {autoResearchCooldown.usedDays}일, 최근 노출 {autoResearchCooldown.seenCount}개는 {autoResearchCooldown.seenDays}일 동안 유사 주제 추천에서 제외했습니다.
+                          </p>
+                        ) : null}
                       </div>
 
                     </div>
