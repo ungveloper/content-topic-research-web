@@ -6,6 +6,7 @@ import {
   topicEntity,
   topicSimilarity,
   topicTheme,
+  topicTokens,
   type AutoResearchCategory,
   type AutoResearchSeed,
 } from "@/lib/auto-research";
@@ -36,7 +37,9 @@ const DETAIL_TYPES = [
   { type: "web", path: "webkr", kind: "naver-web" as SignalKind, display: 12 },
 ] as const;
 
-const MAX_REVIEW_BUNDLES = 5;
+const MAX_REVIEW_BUNDLES = 12;
+const TREND_GROUP_BATCH_SIZE = 5;
+const MAX_TREND_KEYWORDS_PER_GROUP = 5;
 
 type SearchConfig = (typeof DISCOVERY_TYPES)[number] | (typeof DETAIL_TYPES)[number];
 
@@ -54,6 +57,16 @@ type TrendResult = {
   data?: Array<{ period?: string; ratio?: number }>;
 };
 
+type TrendKeywordGroup = {
+  groupName: string;
+  keywords: string[];
+};
+
+type KinQuestionGroup = {
+  representative: SearchItem;
+  related: SearchItem[];
+};
+
 type TopicHistory = {
   title?: string;
   problem?: string;
@@ -64,7 +77,6 @@ type TopicHistory = {
 type AutoRequest = {
   offset?: number;
   usedTopics?: TopicHistory[];
-  seenTopics?: TopicHistory[];
 };
 
 type DiscoveredProblem = {
@@ -199,6 +211,140 @@ function cleanProblemTitle(value: string) {
   return text;
 }
 
+
+function normalizeQuestionTitle(value: string) {
+  return cleanProblemTitle(value)
+    .toLowerCase()
+    .replace(/[^0-9a-z가-힣]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function canonicalQuestionUrl(item: SearchItem) {
+  const raw = cleanUrl(item);
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    ["query", "sm", "where", "from", "utm_source", "utm_medium", "utm_campaign"].forEach((key) => url.searchParams.delete(key));
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return raw.trim();
+  }
+}
+
+function dedupeKinQuestions(items: Array<{ kind: SignalKind; item: SearchItem }>) {
+  const exactSeenUrls = new Set<string>();
+  const exactSeenTitles = new Set<string>();
+  const unique: SearchItem[] = [];
+
+  for (const { item } of items) {
+    const titleKey = normalizeQuestionTitle(item.title || "");
+    const urlKey = canonicalQuestionUrl(item);
+    if (!titleKey) continue;
+    if (urlKey && exactSeenUrls.has(urlKey)) continue;
+    if (exactSeenTitles.has(titleKey)) continue;
+    if (urlKey) exactSeenUrls.add(urlKey);
+    exactSeenTitles.add(titleKey);
+    unique.push(item);
+  }
+
+  const groups: KinQuestionGroup[] = [];
+  for (const item of unique) {
+    const title = normalizeQuestionTitle(item.title || "");
+    const existing = groups.find((group) => {
+      const other = normalizeQuestionTitle(group.representative.title || "");
+      return isSameTopicCluster(title, other) || topicSimilarity(title, other) >= 0.78;
+    });
+    if (existing) {
+      existing.related.push(item);
+    } else {
+      groups.push({ representative: item, related: [] });
+    }
+  }
+
+  return {
+    rawCount: items.length,
+    uniqueCount: unique.length,
+    groups,
+  };
+}
+
+
+function dedupeSearchItems(items: SearchItem[]) {
+  const seenUrls = new Set<string>();
+  const seenTitles = new Set<string>();
+  return items.filter((item) => {
+    const title = normalizeQuestionTitle(item.title || "");
+    const url = canonicalQuestionUrl(item);
+    if (!title && !url) return false;
+    if (url && seenUrls.has(url)) return false;
+    if (title && seenTitles.has(title)) return false;
+    if (url) seenUrls.add(url);
+    if (title) seenTitles.add(title);
+    return true;
+  });
+}
+
+function cleanTrendPhrase(value: string) {
+  return stripHtml(value)
+    .replace(/[?？!！]/g, " ")
+    .replace(/\b(질문|문의)\b/gi, " ")
+    .replace(/(궁금합니다|궁금해요|알려주세요|문의드립니다|어떻게 해야 하나요|어떻게 하나요|가능한가요|가능할까요|되나요|될까요|인가요|일까요|맞나요|하나요|할까요)/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildTrendKeywords(cluster: ProblemCluster) {
+  const title = cleanTrendPhrase(cluster.title);
+  const entity = topicEntity(cluster.title);
+  const theme = topicTheme(cluster.title);
+  const tokens = topicTokens(cluster.title)
+    .map((token) => token.replace(/(으로|에서|에게|까지|부터|보다|처럼|하고|하면|인데|인데요|은|는|이|가|을|를|에|도|만)$/g, ""))
+    .filter((token) => token.length >= 2 && !/^\d+$/.test(token));
+  const core = tokens.slice(0, 4).join(" ");
+  const shortCore = tokens.slice(0, 3).join(" ");
+  const variants: string[] = [];
+
+  if (entity && theme) variants.push(`${entity} ${theme}`);
+  if (shortCore) variants.push(shortCore);
+  if (core && core !== shortCore) variants.push(core);
+  if (title) variants.push(title);
+
+  const intentBase = entity || tokens.slice(0, 2).join(" ");
+  if (intentBase) {
+    if (/버리|폐기/.test(cluster.title)) variants.push(`${intentBase} 버리기`, `${intentBase} 폐기`);
+    if (/청소|세척/.test(cluster.title)) variants.push(`${intentBase} 청소`, `${intentBase} 세척`);
+    if (/보관|정리|수납/.test(cluster.title)) variants.push(`${intentBase} 보관`, `${intentBase} 정리`);
+    if (/삭제|저장공간|용량/.test(cluster.title)) variants.push(`${intentBase} 저장공간`, `${intentBase} 삭제`);
+    if (/신청|신고/.test(cluster.title)) variants.push(`${intentBase} 신청`, `${intentBase} 신고`);
+    if (/냄새|소음|누수|배수|충전|오류|안됨|안 돼/.test(cluster.title) && theme) variants.push(`${intentBase} ${theme}`);
+  }
+
+  for (const raw of cluster.rawTitles.slice(0, 4)) {
+    const cleaned = cleanTrendPhrase(cleanProblemTitle(raw));
+    if (cleaned && cleaned.length <= 35) variants.push(cleaned);
+  }
+
+  const seen = new Set<string>();
+  return variants
+    .map((value) => value.replace(/\s+/g, " ").trim())
+    .filter((value) => value.length >= 2 && value.length <= 40)
+    .filter((value) => {
+      const key = value.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, MAX_TREND_KEYWORDS_PER_GROUP);
+}
+
+function chunk<T>(items: T[], size: number) {
+  const output: T[][] = [];
+  for (let index = 0; index < items.length; index += size) output.push(items.slice(index, index + size));
+  return output;
+}
+
 function isUsefulProblemTitle(title: string, scopeQuery: string) {
   if (title.length < 7 || title.length > 60) return false;
   if (isExcludedContentTopic(title)) return false;
@@ -295,38 +441,63 @@ async function searchNaver(
   return Array.isArray(data.items) ? (data.items as SearchItem[]) : [];
 }
 
-async function fetchTrend(
+async function fetchTrendGroups(
   credentials: { clientId: string; clientSecret: string },
-  keywords: string[],
+  groups: TrendKeywordGroup[],
 ) {
-  if (!keywords.length) return [] as TrendResult[];
+  if (!groups.length) return [] as TrendResult[];
   const end = kstNow();
   const start = new Date(end);
   start.setUTCDate(start.getUTCDate() - 90);
   const endpoint = naverApiHubUrl("/search-trend/v1/search");
-  const body = {
-    startDate: start.toISOString().slice(0, 10),
-    endDate: end.toISOString().slice(0, 10),
-    timeUnit: "week",
-    keywordGroups: keywords.slice(0, MAX_REVIEW_BUNDLES).map((keyword) => ({ groupName: keyword, keywords: [keyword] })),
-  };
+  const results: TrendResult[] = [];
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      ...naverApiHubHeaders(credentials),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-    cache: "no-store",
-  });
-  const data = await readNaverApiHubResponse(response);
+  // NAVER 검색어트렌드는 한 요청의 keywordGroups 수가 제한되므로 5개씩 나눠 조회합니다.
+  for (const batch of chunk(groups, TREND_GROUP_BATCH_SIZE)) {
+    const body = {
+      startDate: start.toISOString().slice(0, 10),
+      endDate: end.toISOString().slice(0, 10),
+      timeUnit: "week",
+      keywordGroups: batch.map((group) => ({
+        groupName: group.groupName,
+        keywords: group.keywords.slice(0, MAX_TREND_KEYWORDS_PER_GROUP),
+      })),
+    };
 
-  if (!response.ok) {
-    throw new Error(naverApiHubErrorMessage(data, "검색어트렌드 조회 실패"));
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        ...naverApiHubHeaders(credentials),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+    const data = await readNaverApiHubResponse(response);
+
+    if (!response.ok) {
+      throw new Error(naverApiHubErrorMessage(data, "검색어트렌드 조회 실패"));
+    }
+
+    if (Array.isArray(data.results)) results.push(...(data.results as TrendResult[]));
   }
 
-  return Array.isArray(data.results) ? (data.results as TrendResult[]) : [];
+  return results;
+}
+
+function dedupeDiscoveredProblems(problems: DiscoveredProblem[]) {
+  const seenUrls = new Set<string>();
+  const seenTitles = new Set<string>();
+  return problems.filter((problem) => {
+    const titleKey = `${problem.category}::${normalizeQuestionTitle(problem.rawTitle || problem.title)}`;
+    const url = canonicalQuestionUrl(problem.item);
+    const urlKey = url ? `${problem.category}::${url}` : "";
+    if (urlKey && seenUrls.has(urlKey)) return false;
+    if (seenTitles.has(titleKey)) return false;
+    if (urlKey) seenUrls.add(urlKey);
+    seenTitles.add(titleKey);
+    return true;
+  });
 }
 
 function clusterProblems(problems: DiscoveredProblem[]) {
@@ -384,9 +555,9 @@ function selectReviewClusters(clusters: ProblemCluster[], count: number) {
   const categoryCounts = new Map<AutoResearchCategory, number>();
 
   // 이 단계는 최종 주제 선정이 아니라 프롬프트 크기를 제한하기 위한 샘플링입니다.
-  // 한 영역에서 최대 2개만 담아 ChatGPT Pro가 서로 다른 문제를 직접 비교할 수 있게 합니다.
+  // 앞단은 넓게 열어 두되 한 영역이 전부를 차지하지 않도록 영역당 최대 3개까지만 우선 담습니다.
   for (const cluster of byPriority) {
-    if ((categoryCounts.get(cluster.category) || 0) >= 2) continue;
+    if ((categoryCounts.get(cluster.category) || 0) >= 3) continue;
     if (!isDiverseFromBatch(cluster, selected)) continue;
     selected.push(cluster);
     categoryCounts.set(cluster.category, (categoryCounts.get(cluster.category) || 0) + 1);
@@ -422,6 +593,10 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  // 중첩 async 함수에서도 TypeScript가 NAVER 자격증명의 null 가능성을 다시 추론하지 않도록
+  // 가드 이후의 non-null 값을 별도 상수로 고정합니다.
+  const naverCredentials: { clientId: string; clientSecret: string } = credentials;
+
   const offset = Math.max(0, Math.min(20, Number(body.offset) || 0));
   const now = kstNow();
   const createdAt = new Date().toISOString();
@@ -432,15 +607,12 @@ export async function POST(request: NextRequest) {
   const usedTopics = (Array.isArray(body.usedTopics) ? body.usedTopics : [])
     .filter((entry) => withinDays(entry.usedAt || entry.updatedAt, 60))
     .slice(-100);
-  const seenTopics = (Array.isArray(body.seenTopics) ? body.seenTopics : [])
-    .filter((entry) => withinDays(entry.updatedAt || entry.usedAt, 14))
-    .slice(-120);
 
   // 1) 지식iN은 문제 발견만 담당합니다. 여기서는 명백한 잡음/금지 분야/최근 중복만 기계적으로 제거합니다.
   const discovered: DiscoveredProblem[] = [];
   for (const seed of seeds) {
     const settled = await Promise.allSettled(
-      DISCOVERY_TYPES.map(async (config) => ({ config, items: await searchNaver(credentials, seed.query, config) })),
+      DISCOVERY_TYPES.map(async (config) => ({ config, items: await searchNaver(naverCredentials, seed.query, config) })),
     );
 
     settled.forEach((result, index) => {
@@ -457,7 +629,6 @@ export async function POST(request: NextRequest) {
         if (isExcludedContentTopic(`${rawTitle} ${item.description || ""}`)) return;
         if (!isUsefulProblemTitle(title, seed.query)) return;
         if (blockedByHistory(title, usedTopics, true)) return;
-        if (blockedByHistory(title, seenTopics, false)) return;
 
         discovered.push({
           category: seed.category,
@@ -472,16 +643,15 @@ export async function POST(request: NextRequest) {
     });
   }
 
-  const clusters = clusterProblems(discovered)
-    .filter((cluster) => !blockedByHistory(cluster.title, usedTopics, true))
-    .filter((cluster) => !blockedByHistory(cluster.title, seenTopics, false));
+  const clusters = clusterProblems(dedupeDiscoveredProblems(discovered))
+    .filter((cluster) => !blockedByHistory(cluster.title, usedTopics, true));
   const reviewClusters = selectReviewClusters(clusters, MAX_REVIEW_BUNDLES);
 
   const cooldown = {
     usedDays: 60,
-    seenDays: 14,
+    seenDays: 0,
     usedCount: usedTopics.length,
-    seenCount: seenTopics.length,
+    seenCount: 0,
   };
 
   if (!reviewClusters.length) {
@@ -494,17 +664,26 @@ export async function POST(request: NextRequest) {
       reviewPrompt: "",
       errors: [
         ...Array.from(new Set(errors)),
-        "최근 사용·노출 주제와 겹치지 않는 새 지식iN 문제를 충분히 찾지 못했습니다. ‘다른 조사 범위로 다시 찾기’를 눌러보세요.",
+        `지식iN 검색은 완료됐지만 독립 질문 후보가 남지 않았습니다. 원시 발견 ${discovered.length}건 중 중복·금지 분야·실제 사용한 최근 주제만 제외했습니다. 단순 노출 이력은 더 이상 차단하지 않습니다.`,
       ].slice(0, 12),
       cooldown,
     });
   }
 
   // 2) 지식iN에서 발견한 각 문제에 대해 나머지 5개 API 데이터를 붙입니다.
-  // 여기서 앱은 coverage를 기록만 하고 "좋은 주제"인지 최종 판정하지 않습니다.
+  // 여기서 앱은 데이터를 넓게 수집·정리할 뿐 "좋은 주제"인지 최종 판정하지 않습니다.
+  const trendKeywordsByQuery = new Map<string, string[]>();
+  const trendBatchByQuery = new Map<string, number>();
   const trendResultByQuery = new Map<string, TrendResult>();
+  const trendGroups = reviewClusters.map((cluster, index) => {
+    const keywords = buildTrendKeywords(cluster);
+    trendKeywordsByQuery.set(cluster.title, keywords);
+    trendBatchByQuery.set(cluster.title, Math.floor(index / TREND_GROUP_BATCH_SIZE) + 1);
+    return { groupName: cluster.title, keywords: keywords.length ? keywords : [cluster.title] };
+  });
+
   try {
-    const trendResults = await fetchTrend(credentials, reviewClusters.map((cluster) => cluster.title));
+    const trendResults = await fetchTrendGroups(naverCredentials, trendGroups);
     for (const result of trendResults) {
       if (typeof result.title === "string" && result.title) trendResultByQuery.set(result.title, result);
     }
@@ -515,18 +694,34 @@ export async function POST(request: NextRequest) {
   const allSignals: Signal[] = [];
   const evidenceBundles: ResearchEvidenceBundle[] = [];
 
-  for (const cluster of reviewClusters) {
+  async function enrichCluster(cluster: ProblemCluster) {
     const bundleSignals: Signal[] = [];
-    const questions = cluster.items.slice(0, 5).map(({ item }) => makeEvidenceItem("naver-kin", item));
+    const questionData = dedupeKinQuestions(cluster.items);
+    const questions = questionData.groups.slice(0, 5).map((group) => {
+      const representative = makeEvidenceItem("naver-kin", group.representative);
+      const relatedQuestions = group.related.slice(0, 4).map((item) => ({
+        title: clipText(item.title, 160) || "제목 없음",
+        url: cleanUrl(item),
+      }));
+      return {
+        ...representative,
+        similarCount: 1 + group.related.length,
+        relatedQuestions: relatedQuestions.length ? relatedQuestions : undefined,
+      };
+    });
 
-    cluster.items.slice(0, 5).forEach(({ item }) => {
+    // 실제 독립 질문만 신호로 저장합니다. 같은 질문/URL의 중복 결과는 반복 수요로 부풀리지 않습니다.
+    const uniqueKinItems = questionData.groups.flatMap((group) => [group.representative, ...group.related]).slice(0, 10);
+    uniqueKinItems.forEach((item) => {
       bundleSignals.push(makeSignal("naver-kin", cluster.title, item, createdAt));
     });
 
+    const trendKeywords = trendKeywordsByQuery.get(cluster.title) || [cluster.title];
+    const supportQuery = trendKeywords.find((keyword) => keyword.length <= 28) || trendKeywords[0] || cluster.title;
     const detailSettled = await Promise.allSettled(
       DETAIL_TYPES.map(async (config) => {
-        const query = config.type === "web" ? `${cluster.title} 공식` : cluster.title;
-        return { config, items: await searchNaver(credentials, query, config) };
+        const query = config.type === "web" ? `${supportQuery} 공식` : supportQuery;
+        return { config, items: await searchNaver(naverCredentials, query, config) };
       }),
     );
 
@@ -534,7 +729,7 @@ export async function POST(request: NextRequest) {
     detailSettled.forEach((result, index) => {
       const config = DETAIL_TYPES[index];
       if (result.status === "fulfilled") {
-        detailByType.set(config.type, result.value.items);
+        detailByType.set(config.type, dedupeSearchItems(result.value.items));
       } else {
         const message = result.reason instanceof Error ? result.reason.message : "검색 실패";
         errors.push(`${cluster.title} · ${config.type}: ${message}`);
@@ -546,11 +741,11 @@ export async function POST(request: NextRequest) {
     const newsItems = (detailByType.get("news") || []).slice(0, 3);
     const webItems = (detailByType.get("web") || []).slice(0, 5);
 
-    cafeItems.forEach((item) => bundleSignals.push(makeSignal("naver-cafe", cluster.title, item, createdAt)));
-    blogItems.forEach((item) => bundleSignals.push(makeSignal("naver-blog", cluster.title, item, createdAt)));
-    newsItems.forEach((item) => bundleSignals.push(makeSignal("naver-news", cluster.title, item, createdAt)));
+    cafeItems.forEach((item) => bundleSignals.push(makeSignal("naver-cafe", supportQuery, item, createdAt)));
+    blogItems.forEach((item) => bundleSignals.push(makeSignal("naver-blog", supportQuery, item, createdAt)));
+    newsItems.forEach((item) => bundleSignals.push(makeSignal("naver-news", supportQuery, item, createdAt)));
     webItems.forEach((item) => {
-      bundleSignals.push(makeSignal(isOfficialUrl(cleanUrl(item)) ? "official" : "naver-web", cluster.title, item, createdAt));
+      bundleSignals.push(makeSignal(isOfficialUrl(cleanUrl(item)) ? "official" : "naver-web", supportQuery, item, createdAt));
     });
 
     const trendResult = trendResultByQuery.get(cluster.title);
@@ -563,28 +758,38 @@ export async function POST(request: NextRequest) {
     const trendSignal: Signal = {
       id: makeId("signal"),
       kind: "naver-trends",
-      title: `${cluster.title} 검색 수요 신호`,
-      query: cluster.title,
-      snippet: `최근 90일 주간 상대 검색지수의 최근 평균 ${recentAverage}/100. 절대 검색량이 아니라 수요·시기 비교용 데이터입니다.`,
+      title: `${cluster.title} 검색 의도군 수요 신호`,
+      query: trendKeywords.join(" | "),
+      snippet: `관련 검색어군 ${trendKeywords.map((keyword) => `“${keyword}”`).join(", ")}을 묶어 본 최근 90일 주간 상대 검색지수의 최근 평균 ${recentAverage}/100. 정확한 장문 질의 하나의 0값을 곧바로 수요 없음으로 해석하지 않습니다.`,
       sourceLabel: "NAVER 검색어트렌드",
       createdAt,
       metrics: { trendScore: recentAverage },
     };
     bundleSignals.push(trendSignal);
 
-    allSignals.push(...bundleSignals);
-    evidenceBundles.push({
+    const discoveredProblem = Array.from(new Set(cluster.rawTitles.map((title) => stripHtml(title).trim()).filter(Boolean)))
+      .slice(0, 3)
+      .join(" / ") || cluster.title;
+
+    const bundle: ResearchEvidenceBundle = {
       id: makeId("bundle"),
       query: cluster.title,
       discoveryCategory: autoResearchCategoryLabel(cluster.category),
-      discoveredProblem: cluster.rawTitles.slice(0, 3).join(" / ") || cluster.title,
+      discoveredProblem,
       sourceSignalIds: bundleSignals.map((signal) => signal.id),
       questions,
+      questionStats: {
+        rawCount: questionData.rawCount,
+        uniqueCount: questionData.uniqueCount,
+        groupedCount: questionData.groups.length,
+      },
       trend: {
         query: cluster.title,
+        keywords: trendKeywords,
+        comparisonBatch: trendBatchByQuery.get(cluster.title) || 1,
         recentAverage,
         series: trendSeries,
-        note: "NAVER 검색어트렌드의 0~100 상대지수이며 절대 검색량이 아닙니다.",
+        note: "NAVER 검색어트렌드의 0~100 상대지수입니다. 원 질문 한 문장이 아니라 관련 검색 의도군을 묶어 확인합니다. API 제한 때문에 최대 5개 후보씩 나눠 조회하므로 서로 다른 comparisonBatch의 ratio 절대값은 직접 비교하지 않습니다. 트렌드가 없다는 이유 하나만으로 후보를 탈락시키지 않습니다.",
       },
       cafe: cafeItems.map((item) => makeEvidenceItem("naver-cafe", item)),
       blog: blogItems.map((item) => makeEvidenceItem("naver-blog", item)),
@@ -597,6 +802,17 @@ export async function POST(request: NextRequest) {
         news: newsItems.length > 0,
         web: webItems.length > 0,
       },
+    };
+
+    return { bundleSignals, bundle };
+  }
+
+  // 후보 10~15개를 전부 직렬 조회하면 느려질 수 있어 3개씩 병렬로 보조 API를 수집합니다.
+  for (const batch of chunk(reviewClusters, 3)) {
+    const enriched = await Promise.all(batch.map((cluster) => enrichCluster(cluster)));
+    enriched.forEach(({ bundleSignals, bundle }) => {
+      allSignals.push(...bundleSignals);
+      evidenceBundles.push(bundle);
     });
   }
 

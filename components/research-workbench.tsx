@@ -28,7 +28,7 @@ import {
   stripHtml,
   verdict,
 } from "@/lib/research";
-import { parseTopicReviewOutput } from "@/lib/topic-review";
+import { buildTopicReviewPrompt, parseTopicReviewOutput } from "@/lib/topic-review";
 import { createSampleData } from "@/lib/sample-data";
 import type {
   Candidate,
@@ -76,12 +76,6 @@ type UsedTopicHistory = {
   usedAt: string;
 };
 
-type SeenTopicHistory = {
-  title: string;
-  problem?: string;
-  seenAt: string;
-};
-
 type AutoResearchResponse = {
   generatedAt: string;
   offset: number;
@@ -92,16 +86,14 @@ type AutoResearchResponse = {
   errors?: string[];
   cooldown?: {
     usedDays: number;
-    seenDays: number;
     usedCount: number;
-    seenCount: number;
   };
 };
 
 const STORAGE_SIGNALS = "content-topic-research:signals:v1";
 const STORAGE_CANDIDATES = "content-topic-research:candidates:v1";
 const STORAGE_USED_TOPICS = "content-topic-research:used-topics:v1";
-const STORAGE_SEEN_TOPICS = "content-topic-research:seen-topics:v1";
+const LEGACY_STORAGE_SEEN_TOPICS = "content-topic-research:seen-topics:v1";
 
 const SCORE_FIELDS: Array<{
   key: keyof ScoreInputs;
@@ -398,8 +390,8 @@ export function ResearchWorkbench() {
   const [autoEvidenceBundles, setAutoEvidenceBundles] = useState<ResearchEvidenceBundle[]>([]);
   const [autoReviewPrompt, setAutoReviewPrompt] = useState("");
   const [autoReviewOutput, setAutoReviewOutput] = useState("");
+  const [autoReviewPromptCopied, setAutoReviewPromptCopied] = useState(false);
   const [usedTopics, setUsedTopics] = useState<UsedTopicHistory[]>([]);
-  const [seenTopics, setSeenTopics] = useState<SeenTopicHistory[]>([]);
 
   const [manualKind, setManualKind] = useState<SignalKind>("official");
   const [manualTitle, setManualTitle] = useState("");
@@ -415,14 +407,14 @@ export function ResearchWorkbench() {
       const storedSignals = window.localStorage.getItem(STORAGE_SIGNALS);
       const storedCandidates = window.localStorage.getItem(STORAGE_CANDIDATES);
       const storedUsedTopics = window.localStorage.getItem(STORAGE_USED_TOPICS);
-      const storedSeenTopics = window.localStorage.getItem(STORAGE_SEEN_TOPICS);
       if (storedSignals) setSignals(JSON.parse(storedSignals));
       if (storedCandidates) {
         const parsed = JSON.parse(storedCandidates) as Candidate[];
         setCandidates(Array.isArray(parsed) ? parsed.filter(isUsableCandidate) : []);
       }
       if (storedUsedTopics) setUsedTopics(JSON.parse(storedUsedTopics));
-      if (storedSeenTopics) setSeenTopics(JSON.parse(storedSeenTopics));
+      // 이전 버전의 14일 노출 차단 기록은 더 이상 사용하지 않습니다.
+      window.localStorage.removeItem(LEGACY_STORAGE_SEEN_TOPICS);
     } catch {
       // 손상된 로컬 데이터가 있어도 앱은 빈 상태로 시작합니다.
     } finally {
@@ -450,21 +442,18 @@ export function ResearchWorkbench() {
     window.localStorage.setItem(STORAGE_USED_TOPICS, JSON.stringify(recent));
   }, [usedTopics, hydrated]);
 
-  useEffect(() => {
-    if (!hydrated) return;
-    const cutoff = Date.now() - 30 * 86_400_000;
-    const recent = seenTopics.filter((item) => {
-      const time = new Date(item.seenAt).getTime();
-      return Number.isFinite(time) && time >= cutoff;
-    });
-    window.localStorage.setItem(STORAGE_SEEN_TOPICS, JSON.stringify(recent));
-  }, [seenTopics, hydrated]);
 
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(null), 2200);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  useEffect(() => {
+    if (!autoReviewPromptCopied) return;
+    const timer = window.setTimeout(() => setAutoReviewPromptCopied(false), 2600);
+    return () => window.clearTimeout(timer);
+  }, [autoReviewPromptCopied]);
 
   const sortedCandidates = useMemo(
     () =>
@@ -508,25 +497,6 @@ export function ResearchWorkbench() {
     setToast("샘플 리서치를 불러왔습니다.");
   }
 
-  function resetAll() {
-    if (!window.confirm("저장된 신호와 후보를 모두 지울까요?")) return;
-    setSignals([]);
-    setCandidates([]);
-    setSelectedSignalIds([]);
-    setActiveCandidateId(null);
-    setNaverItems([]);
-    setAutoResearchSeeds([]);
-    setAutoResearchWarnings([]);
-    setAutoResearchCooldown(null);
-    setAutoEvidenceBundles([]);
-    setAutoReviewPrompt("");
-    setAutoReviewOutput("");
-    setAutoResearchError(null);
-    setAutoResearchOffset(0);
-    window.localStorage.removeItem(STORAGE_SIGNALS);
-    window.localStorage.removeItem(STORAGE_CANDIDATES);
-    setToast("로컬 데이터를 초기화했습니다.");
-  }
 
   function hasWorkspaceWork() {
     return Boolean(
@@ -565,6 +535,7 @@ export function ResearchWorkbench() {
     setAutoEvidenceBundles([]);
     setAutoReviewPrompt("");
     setAutoReviewOutput("");
+    setAutoReviewPromptCopied(false);
     setAutoResearchError(null);
     setAutoResearchOffset(0);
     setManualTitle("");
@@ -688,6 +659,7 @@ export function ResearchWorkbench() {
     setAutoEvidenceBundles([]);
     setAutoReviewPrompt("");
     setAutoReviewOutput("");
+    setAutoReviewPromptCopied(false);
 
     try {
       const response = await fetch("/api/research/auto", {
@@ -700,18 +672,6 @@ export function ResearchWorkbench() {
             problem: item.problem,
             usedAt: item.usedAt,
           })),
-          seenTopics: [
-            ...seenTopics.map((item) => ({
-              title: item.title,
-              problem: item.problem,
-              updatedAt: item.seenAt,
-            })),
-            ...candidates.map((candidate) => ({
-              title: candidate.title,
-              problem: candidate.problem,
-              updatedAt: candidate.updatedAt,
-            })),
-          ],
         }),
       });
       const data = (await response.json()) as AutoResearchResponse & { error?: string };
@@ -755,29 +715,13 @@ export function ResearchWorkbench() {
       setAutoResearchCooldown(data.cooldown || null);
       setAutoEvidenceBundles(normalizedBundles);
       setAutoReviewPrompt(typeof data.reviewPrompt === "string" ? data.reviewPrompt : "");
-      if (normalizedBundles.length) {
-        const seenAt = new Date().toISOString();
-        setSeenTopics((current) => {
-          const byTitle = new Map(current.map((item) => [item.title.trim().toLowerCase(), item]));
-          normalizedBundles.forEach((bundle) => {
-            byTitle.set(bundle.query.trim().toLowerCase(), {
-              title: bundle.query,
-              problem: bundle.discoveredProblem,
-              seenAt,
-            });
-          });
-          return Array.from(byTitle.values()).slice(-160);
-        });
-      }
 
       if (normalizedBundles.length && data.reviewPrompt) {
-        await writeClipboard(data.reviewPrompt);
-        setToast(`NAVER 증거 번들 ${normalizedBundles.length}개를 만들고 ChatGPT Pro 주제 심사 프롬프트를 복사했습니다.`);
         window.setTimeout(() => {
           document.getElementById("topic-review-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
         }, 0);
       } else {
-        setToast("조사는 완료됐지만 ChatGPT Pro에 넘길 새 후보를 찾지 못했습니다. 다른 조사 범위로 다시 찾아보세요.");
+        setToast("조사는 완료됐지만 이번 검색에서 중복·제외 기준을 통과한 독립 질문을 찾지 못했습니다. 이전에 보기만 한 후보는 더 이상 차단하지 않으므로 다시 조회해도 됩니다.");
       }
     } catch (error) {
       setAutoResearchError(error instanceof Error ? error.message : "조사 데이터 수집에 실패했습니다.");
@@ -789,7 +733,32 @@ export function ResearchWorkbench() {
   async function copyAutoReviewPrompt() {
     if (!autoReviewPrompt) return;
     await writeClipboard(autoReviewPrompt);
-    setToast("ChatGPT Pro 주제 심사 프롬프트를 다시 복사했습니다.");
+    setAutoReviewPromptCopied(true);
+    setToast("심사 프롬프트를 복사했습니다. ChatGPT Pro에 붙여넣으세요.");
+  }
+
+  function reviewPromptForBundles(bundles: ResearchEvidenceBundle[]) {
+    return buildTopicReviewPrompt(bundles, {
+      generatedAt: new Date().toISOString(),
+      seeds: autoResearchSeeds,
+      cooldown: {
+        usedDays: autoResearchCooldown?.usedDays ?? 60,
+        seenDays: 0,
+        usedCount: autoResearchCooldown?.usedCount ?? 0,
+        seenCount: 0,
+      },
+    });
+  }
+
+  async function copyEvidenceBundlePrompt(bundle: ResearchEvidenceBundle) {
+    const prompt = reviewPromptForBundles([bundle]);
+    await writeClipboard(prompt);
+
+    const remainingBundles = autoEvidenceBundles.filter((item) => item.id !== bundle.id);
+    setAutoEvidenceBundles(remainingBundles);
+    setAutoReviewPrompt(remainingBundles.length ? reviewPromptForBundles(remainingBundles) : "");
+    setAutoReviewPromptCopied(false);
+    setToast(`“${bundle.query}” 프롬프트를 복사했고 현재 결과 목록에서 숨겼습니다.`);
   }
 
   async function copyEvidenceJson() {
@@ -1100,15 +1069,15 @@ export function ResearchWorkbench() {
   const activePrompt = activeCandidate ? promptForCandidate(activeCandidate, signals) : "";
 
   return (
-    <div className="min-h-screen bg-[#f7f7f5] text-zinc-900">
+    <div className="min-h-screen w-full max-w-full overflow-x-hidden bg-[#f7f7f5] text-zinc-900">
       {toast ? (
-        <div className="fixed left-1/2 top-5 z-50 -translate-x-1/2 rounded-full border border-zinc-200 bg-zinc-950 px-4 py-2 text-xs font-medium text-white shadow-lg">
+        <div className="fixed left-1/2 top-5 z-50 max-w-[calc(100vw-2rem)] -translate-x-1/2 break-words rounded-full border border-zinc-200 bg-zinc-950 px-4 py-2 text-center text-xs font-medium text-white shadow-lg [overflow-wrap:anywhere]">
           {toast}
         </div>
       ) : null}
 
       <header className="sticky top-0 z-40 border-b border-zinc-200/80 bg-[#f7f7f5]/95 backdrop-blur">
-        <div className="mx-auto flex h-16 max-w-[1500px] items-center justify-between px-4 sm:px-6">
+        <div className="mx-auto flex h-16 w-full min-w-0 max-w-[1500px] items-center justify-start px-4 sm:px-6">
           <button
             type="button"
             onClick={handleBrandHome}
@@ -1123,63 +1092,20 @@ export function ResearchWorkbench() {
               <div className="hidden text-[11px] text-zinc-400 sm:block">생산 자동화보다 선별 자동화</div>
             </div>
           </button>
-          <div className="flex items-center gap-2">
-            <button type="button" onClick={loadSample} className="hidden rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-50 sm:block">샘플 불러오기</button>
-            <button type="button" onClick={resetAll} className="rounded-lg px-3 py-2 text-xs font-medium text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700">초기화</button>
-          </div>
         </div>
       </header>
 
-      <div className="mx-auto max-w-[1500px] px-4 py-5 sm:px-6 lg:grid lg:grid-cols-[220px_minmax(0,1fr)] lg:gap-7">
-        <aside className="mb-5 lg:sticky lg:top-20 lg:z-20 lg:mb-0 lg:self-start">
-          <div className="rounded-2xl bg-[#f7f7f5] lg:p-1">
-          <nav className="flex gap-2 overflow-x-auto pb-1 lg:block lg:space-y-1">
-            {([
-              ["discover", "탐색", SearchIcon],
-              ["candidates", "주제 후보", LayersIcon],
-              ["prompt", "제작 프롬프트", FileTextIcon],
-            ] as const).map(([value, label, Icon]) => (
-              <button
-                key={value}
-                type="button"
-                onClick={() => setTab(value)}
-                className={classNames(
-                  "flex shrink-0 items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-medium transition lg:w-full",
-                  tab === value ? "bg-zinc-900 text-white" : "text-zinc-500 hover:bg-white hover:text-zinc-900",
-                )}
-              >
-                <Icon className="h-4 w-4" />
-                {label}
-                {value === "candidates" && candidates.length ? (
-                  <span className={classNames("ml-auto rounded-full px-1.5 text-[10px]", tab === value ? "bg-white/15" : "bg-zinc-200 text-zinc-500")}>{candidates.length}</span>
-                ) : null}
-              </button>
-            ))}
-          </nav>
-
-          <div className="mt-6 hidden rounded-2xl border border-zinc-200 bg-white p-4 lg:block">
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">판단 원칙</div>
-            <ul className="mt-3 space-y-2 text-xs leading-5 text-zinc-500">
-              <li>코드 = 수집·정리·중복 제거</li>
-              <li>지식iN = 실제 질문 발견</li>
-              <li>5개 API = 교차 증거 수집</li>
-              <li>ChatGPT Pro = 주제 최종 심사</li>
-              <li>사람 = 테스트·발행 시점 제어</li>
-            </ul>
-          </div>
-          </div>
-        </aside>
-
-        <main className="min-w-0">
+      <div className="mx-auto w-full min-w-0 max-w-[1280px] overflow-x-hidden px-4 py-5 sm:px-6">
+        <main className="w-full min-w-0 max-w-full overflow-x-hidden">
           {tab === "discover" ? (
             <div className="space-y-6">
-              <section className="overflow-hidden rounded-3xl border border-zinc-900 bg-zinc-950 p-5 text-white sm:p-6">
-                <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_340px] xl:items-end">
+              <section className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-900 bg-zinc-950 p-5 text-white sm:p-6">
+                <div className="grid min-w-0 max-w-full gap-6 xl:grid-cols-[minmax(0,1fr)_340px] xl:items-end">
                   <div>
                     <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">One-click Research</div>
                     <h2 className="text-2xl font-semibold tracking-[-0.04em]">NAVER 데이터를 모으고 ChatGPT Pro에게 주제 심사를 맡기기</h2>
-                    <p className="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
-                      앱은 지식iN에서 실제 질문을 찾고, 각 질문마다 검색어트렌드·카페·블로그·뉴스·웹문서 데이터를 Evidence Bundle JSON으로 묶는 데까지만 담당합니다. 스크립트 점수가 최종 주제를 결정하지 않습니다. 수집이 끝나면 모든 근거가 포함된 ChatGPT Pro 주제 심사 프롬프트를 자동으로 복사하고, 실제 선정·보류·직접 테스트 판단은 ChatGPT Pro 결과를 확인한 뒤 내가 직접 불러옵니다. 의료·법률·금융·재정·전문 안전 주제는 앞단과 심사 프롬프트에서 이중으로 제외합니다.
+                    <p className="mt-2 max-w-3xl break-words text-sm leading-6 text-zinc-400 [overflow-wrap:anywhere]">
+                      앱은 지식iN에서 실제 질문을 넓게 찾고, 동일 URL·동일 질문은 제거한 뒤 유사 질문을 묶습니다. 그중 서로 다른 문제를 최대 10~15개 수준으로 추려 검색어트렌드·카페·블로그·뉴스·웹문서 데이터를 Evidence Bundle JSON으로 붙입니다. 검색어트렌드는 원 질문 한 문장만 보지 않고 관련 검색 의도군을 함께 조회합니다. 스크립트는 수집·정리만 하고 최종 주제를 결정하지 않습니다. 수집이 끝나면 ChatGPT Pro 주제 심사 프롬프트를 화면에 준비하며, 내가 직접 복사해 심사 결과를 확인한 뒤 선정 후보를 불러옵니다. 의료·법률·금융·재정·전문 안전 주제는 앞단과 심사 프롬프트에서 이중으로 제외합니다.
                     </p>
                     <div className="mt-4 flex flex-wrap gap-2 text-[11px] text-zinc-400">
                       <span className="rounded-full border border-zinc-800 px-2.5 py-1">지식iN · 실제 질문</span>
@@ -1191,30 +1117,62 @@ export function ResearchWorkbench() {
                     </div>
                   </div>
                   <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-4">
-                    <div className="text-xs font-medium text-zinc-300">오늘 할 일</div>
-                    <p className="mt-1 text-xs leading-5 text-zinc-500">버튼을 누르면 NAVER 6개 API 데이터만 수집·정리합니다. 발행 후보 선정은 자동으로 확정하지 않고 ChatGPT Pro 심사 결과를 내가 다시 불러올 때만 진행합니다.</p>
-                    <div className="mt-2 text-[11px] leading-5 text-zinc-500">
-                      최근 프롬프트 사용 {usedTopics.filter((item) => Date.now() - new Date(item.usedAt).getTime() <= 60 * 86_400_000).length}개 · 60일 중복 방지
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => void runAutoResearch(0)}
-                      disabled={autoResearchLoading}
-                      className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-white px-4 py-3 text-sm font-semibold text-zinc-950 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      <SparkIcon className="h-4 w-4" />
-                      {autoResearchLoading ? "NAVER 6개 API 증거 수집 중..." : "오늘의 자동 탐색 시작"}
-                    </button>
-                    {autoResearchSeeds.length ? (
-                      <button
-                        type="button"
-                        onClick={() => void runAutoResearch(autoResearchOffset + 1)}
-                        disabled={autoResearchLoading}
-                        className="mt-2 w-full rounded-xl border border-zinc-700 px-4 py-2.5 text-xs font-medium text-zinc-300 transition hover:border-zinc-500 hover:text-white disabled:opacity-50"
-                      >
-                        다른 조사 범위로 다시 찾기
-                      </button>
-                    ) : null}
+                    {!autoResearchLoading && autoReviewPrompt ? (
+                      <>
+                        <div className="text-xs font-medium text-zinc-300">프롬프트 복사하기</div>
+                        <p className="mt-1 text-xs leading-5 text-zinc-500">NAVER 6개 API 증거 수집이 끝났습니다. 아래 프롬프트를 복사해 ChatGPT Pro에 붙여넣고 추천 순위를 확인한 뒤 번호만 선택하면 됩니다.</p>
+                        <div className="mt-2 text-[11px] leading-5 text-zinc-500">
+                          최근 프롬프트 사용 {usedTopics.filter((item) => Date.now() - new Date(item.usedAt).getTime() <= 60 * 86_400_000).length}개 · 60일 중복 방지
+                        </div>
+                        <div className="mt-4">
+                          <button
+                            type="button"
+                            onClick={() => void copyAutoReviewPrompt()}
+                            className={classNames(
+                              "flex w-full min-w-0 items-center justify-center gap-2 rounded-xl border px-3 py-2.5 text-xs font-medium transition",
+                              autoReviewPromptCopied
+                                ? "border-emerald-700 bg-emerald-950/30 text-emerald-300"
+                                : "border-zinc-700 text-zinc-300 hover:border-zinc-500 hover:text-white",
+                            )}
+                          >
+                            {autoReviewPromptCopied ? <CheckIcon className="h-3.5 w-3.5 shrink-0" /> : <CopyIcon className="h-3.5 w-3.5 shrink-0" />}
+                            <span className="min-w-0 truncate">{autoReviewPromptCopied ? "복사 완료" : "프롬프트 복사"}</span>
+                          </button>
+                          <div aria-live="polite" className="min-h-5 pt-1.5 text-center text-[10px] leading-4 text-zinc-500">
+                            {autoReviewPromptCopied ? "클립보드에 복사되었습니다. ChatGPT Pro에 붙여넣으세요." : "추천 번호를 선택하면 조사·검증형은 공식 원문 검증 후 WordPress 원고 작성까지 이어집니다."}
+                          </div>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="text-xs font-medium text-zinc-300">오늘 할 일</div>
+                        <p className="mt-1 text-xs leading-5 text-zinc-500">버튼을 누르면 NAVER 6개 API 데이터를 수집·정리하고 ChatGPT Pro 심사 프롬프트를 만듭니다. 최종 주제 판단은 ChatGPT Pro가 하고, 내가 추천 번호를 선택합니다.</p>
+                        <div className="mt-2 text-[11px] leading-5 text-zinc-500">
+                          최근 프롬프트 사용 {usedTopics.filter((item) => Date.now() - new Date(item.usedAt).getTime() <= 60 * 86_400_000).length}개 · 60일 중복 방지
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => void runAutoResearch(0)}
+                          disabled={autoResearchLoading}
+                          className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-white px-4 py-3 text-sm font-semibold text-zinc-950 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {autoResearchLoading ? (
+                            <>
+                              <span
+                                aria-hidden="true"
+                                className="h-4 w-4 animate-spin rounded-full border-2 border-zinc-300 border-t-zinc-950"
+                              />
+                              NAVER 6개 API 증거 수집 중...
+                            </>
+                          ) : (
+                            <>
+                              <SparkIcon className="h-4 w-4" />
+                              오늘의 자동 탐색 시작
+                            </>
+                          )}
+                        </button>
+                      </>
+                    )}
                   </div>
                 </div>
 
@@ -1238,7 +1196,7 @@ export function ResearchWorkbench() {
                         </div>
                         {autoResearchCooldown ? (
                           <p className="mt-2 text-[11px] leading-5 text-zinc-500">
-                            최근 사용 {autoResearchCooldown.usedCount}개는 {autoResearchCooldown.usedDays}일, 최근 노출 {autoResearchCooldown.seenCount}개는 {autoResearchCooldown.seenDays}일 동안 유사 주제 추천에서 제외했습니다.
+                            실제로 콘텐츠 제작에 사용한 최근 주제 {autoResearchCooldown.usedCount}개만 {autoResearchCooldown.usedDays}일 동안 유사 주제 추천에서 제외합니다. 단순 조사·노출만으로는 후보를 차단하지 않습니다.
                           </p>
                         ) : null}
                       </div>
@@ -1260,19 +1218,39 @@ export function ResearchWorkbench() {
                 <section id="topic-review-panel" className="scroll-mt-24 rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
                   <SectionTitle
                     eyebrow="ChatGPT Pro Topic Review"
-                    title="수집한 JSON은 그대로 두고, 주제 판단은 ChatGPT Pro에서"
-                    description="앱은 Evidence Bundle을 만들었을 뿐 최종 주제를 선정하지 않았습니다. 복사된 프롬프트를 ChatGPT Pro 새 대화에 붙여넣고, 반환된 JSON 전체를 아래 입력란에 붙여넣은 뒤 직접 후보를 불러오세요. 선정 후보는 최대 3개이며, 데이터가 약하면 0개여도 정상입니다."
+                    title="오늘의 데이터가 담긴 프롬프트를 ChatGPT Pro에서 직접 심사"
+                    description="Evidence Bundle이 포함된 심사 프롬프트를 ChatGPT Pro에 입력하면 최대 3개의 주제를 추천합니다. 그 대화에서 1·2·3 중 하나만 선택하면 조사·검증형은 별도 확인 요청 없이 공식 원문 재검증부터 Auto Publisher용 WordPress 원고 작성까지 이어서 진행합니다. 직접 테스트형만 실제 테스트 결과가 필요합니다."
                   />
 
-                  <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_260px]">
+                  <div className="mb-5 rounded-2xl border border-zinc-200 bg-zinc-50 p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-xs font-semibold text-zinc-700">ChatGPT Pro에 입력할 주제 심사 프롬프트</div>
+                        <p className="mt-1 text-[11px] leading-5 text-zinc-400">오늘 수집한 지식iN 질문과 검색어트렌드·카페·블로그·뉴스·웹문서 Evidence JSON이 포함되어 있습니다. 앱은 이 프롬프트를 만들기만 하며, 실제 주제 선정은 ChatGPT Pro가 합니다.</p>
+                      </div>
+                      <button type="button" onClick={() => void copyAutoReviewPrompt()} className={classNames("inline-flex min-w-0 items-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition", autoReviewPromptCopied ? "bg-emerald-700 text-white" : "bg-zinc-900 text-white hover:bg-zinc-800")}>
+                        {autoReviewPromptCopied ? <CheckIcon className="h-3.5 w-3.5 shrink-0" /> : <CopyIcon className="h-3.5 w-3.5 shrink-0" />}
+                        <span className="truncate">{autoReviewPromptCopied ? "복사 완료" : "프롬프트 복사"}</span>
+                      </button>
+                    </div>
+                    <textarea
+                      value={autoReviewPrompt}
+                      readOnly
+                      rows={14}
+                      className="mt-3 w-full resize-y rounded-xl border border-zinc-200 bg-white p-4 font-mono text-[11px] leading-5 text-zinc-600 outline-none"
+                    />
+                  </div>
+
+                  <div className="grid min-w-0 max-w-full gap-3 lg:grid-cols-[minmax(0,1fr)_260px]">
                     <div className="rounded-2xl bg-zinc-50 p-4">
                       <div className="text-xs font-semibold text-zinc-700">오늘의 Evidence Bundle</div>
                       <p className="mt-1 text-xs leading-5 text-zinc-500">
-                        지식iN에서 발견한 문제 {autoEvidenceBundles.length}개를 기준으로 검색어트렌드·카페·블로그·뉴스·웹문서 데이터를 묶었습니다. 각 원문 URL과 스니펫도 ChatGPT Pro 심사 프롬프트에 포함됩니다.
+                        지식iN 원시 결과의 중복을 제거하고 유사 질문을 묶은 뒤, 서로 다른 문제 {autoEvidenceBundles.length}개를 Evidence Bundle로 만들었습니다. 각 후보에는 관련 검색어군 트렌드와 카페·블로그·뉴스·웹문서 원문 URL/스니펫이 포함되며 최종 판단은 ChatGPT Pro가 합니다.
                       </p>
                       <div className="mt-3 flex flex-wrap gap-2">
-                        <button type="button" onClick={() => void copyAutoReviewPrompt()} className="inline-flex items-center gap-2 rounded-xl bg-zinc-900 px-3 py-2 text-xs font-medium text-white hover:bg-zinc-800">
-                          <CopyIcon className="h-3.5 w-3.5" /> 주제 심사 프롬프트 다시 복사
+                        <button type="button" onClick={() => void copyAutoReviewPrompt()} className={classNames("inline-flex min-w-0 items-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition", autoReviewPromptCopied ? "bg-emerald-700 text-white" : "bg-zinc-900 text-white hover:bg-zinc-800")}>
+                          {autoReviewPromptCopied ? <CheckIcon className="h-3.5 w-3.5 shrink-0" /> : <CopyIcon className="h-3.5 w-3.5 shrink-0" />}
+                          <span className="truncate">{autoReviewPromptCopied ? "복사 완료" : "프롬프트 다시 복사"}</span>
                         </button>
                         <button type="button" onClick={() => void copyEvidenceJson()} className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs font-medium text-zinc-600 hover:border-zinc-300 hover:text-zinc-900">
                           <FileTextIcon className="h-3.5 w-3.5" /> Evidence JSON 복사
@@ -1283,23 +1261,40 @@ export function ResearchWorkbench() {
                       <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">수동 제어 흐름</div>
                       <ol className="mt-2 space-y-1.5 text-xs leading-5 text-zinc-600">
                         <li>1. NAVER 데이터 수집</li>
-                        <li>2. ChatGPT Pro에서 주제 심사</li>
-                        <li>3. 심사 JSON을 아래에 붙여넣기</li>
-                        <li>4. 내가 후보 불러오기 버튼 클릭</li>
-                        <li>5. 직접 테스트 또는 조사 후 최종 글 작성</li>
+                        <li>2. 생성된 프롬프트를 내가 확인·복사</li>
+                        <li>3. ChatGPT Pro가 주제를 비교·추천</li>
+                        <li>4. 내가 1·2·3 중 하나만 선택</li>
+                        <li>5. 조사·검증형은 공식 원문 재검증 후 바로 WordPress 원고 작성</li>
+                        <li>6. 직접 테스트형만 실제 결과를 기록한 뒤 원고 작성</li>
                       </ol>
                     </div>
                   </div>
 
-                  <div className="mt-5 grid gap-3 lg:grid-cols-2">
+                  <div className="mt-5 grid min-w-0 max-w-full gap-3 lg:grid-cols-2">
                     {autoEvidenceBundles.map((bundle) => (
-                      <article key={bundle.id} className="rounded-2xl border border-zinc-200 p-4">
+                      <article
+                        key={bundle.id}
+                        role="button"
+                        tabIndex={0}
+                        title="클릭하면 이 후보만 담은 프롬프트를 복사하고 현재 목록에서 숨깁니다."
+                        onClick={(event) => {
+                          if ((event.target as HTMLElement).closest("a,button")) return;
+                          void copyEvidenceBundlePrompt(bundle);
+                        }}
+                        onKeyDown={(event) => {
+                          if ((event.target as HTMLElement).closest("a,button")) return;
+                          if (event.key !== "Enter" && event.key !== " ") return;
+                          event.preventDefault();
+                          void copyEvidenceBundlePrompt(bundle);
+                        }}
+                        className="min-w-0 max-w-full cursor-pointer overflow-hidden rounded-2xl border border-zinc-200 p-4 transition hover:border-zinc-400 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-zinc-300"
+                      >
                         <div className="flex flex-wrap items-start justify-between gap-3">
                           <div className="min-w-0">
                             <div className="text-[11px] font-medium text-zinc-400">{bundle.discoveryCategory}</div>
-                            <h3 className="mt-1 font-semibold leading-6 text-zinc-800">{bundle.query}</h3>
+                            <h3 className="mt-1 break-words font-semibold leading-6 text-zinc-800 [overflow-wrap:anywhere]">{bundle.query}</h3>
                           </div>
-                          <div className="rounded-lg bg-zinc-100 px-2 py-1 text-[11px] font-medium text-zinc-500">지식iN {bundle.questions.length}건</div>
+                          <div className="rounded-lg bg-zinc-100 px-2 py-1 text-[11px] font-medium text-zinc-500">지식iN 독립 질문 {bundle.questionStats?.uniqueCount ?? bundle.questions.length}건</div>
                         </div>
                         <div className="mt-3 flex flex-wrap gap-1.5 text-[10px] text-zinc-500">
                           <span className={classNames("rounded-full px-2 py-1", bundle.coverage.trend ? "bg-emerald-50 text-emerald-700" : "bg-zinc-100")}>트렌드 {bundle.coverage.trend ? "있음" : "없음"}</span>
@@ -1308,39 +1303,60 @@ export function ResearchWorkbench() {
                           <span className={classNames("rounded-full px-2 py-1", bundle.coverage.news ? "bg-emerald-50 text-emerald-700" : "bg-zinc-100")}>뉴스 {bundle.news.length}</span>
                           <span className={classNames("rounded-full px-2 py-1", bundle.coverage.web ? "bg-emerald-50 text-emerald-700" : "bg-zinc-100")}>웹문서 {bundle.web.length}</span>
                         </div>
+                        {bundle.trend.keywords?.length ? (
+                          <p className="mt-2 break-words text-[10px] leading-4 text-zinc-400 [overflow-wrap:anywhere]">트렌드 검색어군 · {bundle.trend.keywords.join(" · ")} · 비교 배치 {bundle.trend.comparisonBatch || 1}</p>
+                        ) : null}
                         <div className="mt-3 space-y-2">
                           {bundle.questions.slice(0, 3).map((question, index) => (
                             <div key={`${bundle.id}-q-${index}`} className="rounded-xl bg-zinc-50 p-3">
                               <div className="flex items-start justify-between gap-3">
-                                <p className="text-xs leading-5 text-zinc-700">{question.title}</p>
+                                <div className="min-w-0">
+                                  <p className="break-words text-xs leading-5 text-zinc-700 [overflow-wrap:anywhere]">{question.title}</p>
+                                  {(question.similarCount || 1) > 1 ? (
+                                    <p className="mt-1 text-[10px] font-medium text-emerald-700">유사한 독립 질문 {question.similarCount}건 묶음</p>
+                                  ) : null}
+                                </div>
                                 {question.url ? (
                                   <a href={question.url} target="_blank" rel="noreferrer" className="shrink-0 text-[10px] font-medium text-zinc-400 hover:text-zinc-900">
                                     원문 <ExternalIcon className="ml-0.5 inline h-3 w-3" />
                                   </a>
                                 ) : null}
                               </div>
+                              {question.relatedQuestions?.length ? (
+                                <div className="mt-2 space-y-1 border-t border-zinc-200/70 pt-2">
+                                  {question.relatedQuestions.slice(0, 3).map((related, relatedIndex) => (
+                                    <div key={`${bundle.id}-q-${index}-related-${relatedIndex}`} className="flex items-start justify-between gap-2 text-[10px] leading-4 text-zinc-500">
+                                      <span className="min-w-0 break-words line-clamp-1 [overflow-wrap:anywhere]">↳ {related.title}</span>
+                                      {related.url ? (
+                                        <a href={related.url} target="_blank" rel="noreferrer" className="shrink-0 font-medium text-zinc-400 hover:text-zinc-900">원문</a>
+                                      ) : null}
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : null}
                             </div>
                           ))}
                         </div>
+                        <p className="mt-3 border-t border-zinc-100 pt-3 text-[10px] font-medium text-zinc-400">카드 빈 영역을 클릭하면 이 후보만 담은 프롬프트를 복사하고 현재 목록에서 숨깁니다.</p>
                       </article>
                     ))}
                   </div>
 
                   <details className="mt-5 rounded-2xl border border-zinc-200 p-4">
                     <summary className="cursor-pointer text-xs font-semibold text-zinc-600">Evidence Bundle JSON 미리보기</summary>
-                    <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-xl bg-zinc-950 p-4 text-[10px] leading-5 text-zinc-300">{JSON.stringify(autoEvidenceBundles, null, 2)}</pre>
+                    <pre className="mt-3 max-h-72 w-full min-w-0 max-w-full overflow-auto whitespace-pre-wrap break-all rounded-xl bg-zinc-950 p-4 text-[10px] leading-5 text-zinc-300">{JSON.stringify(autoEvidenceBundles, null, 2)}</pre>
                   </details>
 
                   <div className="mt-5 border-t border-zinc-100 pt-5">
                     <label className="block">
-                      <span className="text-xs font-semibold text-zinc-700">ChatGPT Pro 주제 심사 결과 붙여넣기</span>
-                      <span className="mt-1 block text-[11px] leading-5 text-zinc-400">ChatGPT가 반환한 JSON 전체 또는 ```json 코드블록을 그대로 붙여넣으면 됩니다. hold/exclude는 후보 목록에 들어오지 않습니다.</span>
+                      <span className="text-xs font-semibold text-zinc-700">선택 사항 · ChatGPT Pro 심사 결과를 앱에 보관</span>
+                      <span className="mt-1 block text-[11px] leading-5 text-zinc-400">WordPress 글 작성만 원하면 ChatGPT Pro에서 추천 번호를 선택하면 됩니다. 후보 큐에 저장하거나 직접 테스트 기록을 관리하고 싶을 때만 추천 보고서와 마지막 ```json 코드블록을 포함한 답변 전체를 여기에 붙여넣으세요.</span>
                       <textarea
                         value={autoReviewOutput}
                         onChange={(event) => setAutoReviewOutput(event.target.value)}
                         rows={10}
                         placeholder='{"reviewSummary":"...","reviews":[...]}'
-                        className="mt-2 w-full resize-y rounded-2xl border border-zinc-200 bg-zinc-50 p-4 font-mono text-xs leading-5 outline-none placeholder:text-zinc-300 focus:border-zinc-400"
+                        className="mt-2 w-full min-w-0 max-w-full resize-y rounded-2xl border border-zinc-200 bg-zinc-50 p-4 font-mono text-xs leading-5 outline-none placeholder:text-zinc-300 focus:border-zinc-400"
                       />
                     </label>
                     <button
@@ -1355,14 +1371,14 @@ export function ResearchWorkbench() {
                 </section>
               ) : null}
 
-              <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+              <section className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
                 <SectionTitle
                   eyebrow="Manual Search"
                   title="직접 찾고 싶은 주제가 있을 때만 검색"
                   description="자동 탐색에서 빠진 주제를 더 조사하고 싶을 때만 사용합니다. 블로그·카페·지식iN은 문제 탐지, 뉴스는 변경 감지, 웹문서는 근거 후보 탐색에 사용합니다."
                 />
                 <div className="grid gap-3 lg:grid-cols-[170px_minmax(0,1fr)_120px_110px]">
-                  <select value={naverType} onChange={(event) => setNaverType(event.target.value as NaverType)} className="rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-3 text-sm outline-none focus:border-zinc-400">
+                  <select value={naverType} onChange={(event) => setNaverType(event.target.value as NaverType)} className="min-w-0 max-w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-3 text-sm outline-none focus:border-zinc-400">
                     {NAVER_TYPES.map((type) => <option key={type.value} value={type.value}>{type.label}</option>)}
                   </select>
                   <div className="relative">
@@ -1401,7 +1417,7 @@ export function ResearchWorkbench() {
                 ) : null}
               </section>
 
-              <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+              <section className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
                 <SectionTitle
                   eyebrow="Signal 02"
                   title="NAVER 검색어트렌드로 수요와 시기 확인"
@@ -1446,7 +1462,7 @@ export function ResearchWorkbench() {
               </section>
 
               <div className="grid gap-6 xl:grid-cols-2">
-                <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+                <section className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
                   <SectionTitle
                     eyebrow="Signal 03"
                     title="수동 조사 신호 추가"
@@ -1473,7 +1489,7 @@ export function ResearchWorkbench() {
                   </div>
                 </section>
 
-                <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+                <section className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
                   <SectionTitle
                     eyebrow="Signal 04"
                     title="Search Console 실제 기회 가져오기"
@@ -1567,7 +1583,7 @@ export function ResearchWorkbench() {
 
               <section className="min-w-0">
                 {activeCandidate ? (
-                  <div className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+                  <div className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
                     <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
                       <div>
                         <div className="mb-2 flex items-center gap-2">
@@ -1619,7 +1635,7 @@ function CandidateEditor({
 
   return (
     <div className="space-y-5">
-      <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+      <section className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
             <div className="mb-2 flex flex-wrap gap-2">
@@ -1675,7 +1691,7 @@ function CandidateEditor({
         </button>
       </section>
 
-      <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+      <section className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
         <SectionTitle
           eyebrow="Review Rubric"
           title={candidate.aiReview ? "ChatGPT Pro 심사의 보조 평가값" : "수동 후보의 보조 평가값"}
@@ -1726,7 +1742,7 @@ function CandidateEditor({
         </section>
       ) : null}
 
-      <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+      <section className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
         <SectionTitle eyebrow="Original Value" title={candidate.aiReview ? "ChatGPT Pro가 선정 단계에서 설계한 고유 결과물" : "고유 결과물과 검증 방식"} description="일반적인 SEO 글이 아니라 비교표·판단 흐름·체크리스트·공식자료 대조처럼 실제 추가 가치를 만드는 방향인지 최종 글 작성 전 다시 확인합니다." />
         <div className="grid gap-3 lg:grid-cols-2">
           <div className="rounded-2xl bg-zinc-50 p-4">
@@ -1746,7 +1762,7 @@ function CandidateEditor({
         ) : null}
       </section>
 
-      <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+      <section className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
         <SectionTitle
           eyebrow="Question Sources"
           title={`실제 문제 발견 출처 ${questionSignals.length}개`}
@@ -1780,7 +1796,7 @@ function CandidateEditor({
         )}
       </section>
 
-      <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+      <section className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <SectionTitle eyebrow="Evidence Set" title={`연결된 조사 신호 ${linkedSignals.length}개`} description="사용자가 별도로 고를 필요는 없습니다. 자동 탐색이 연결한 신호를 ChatGPT가 참고하고, 부족한 근거는 웹 검색으로 추가 확인하도록 프롬프트에 포함합니다." />
         </div>
@@ -1803,7 +1819,7 @@ function CandidateEditor({
         ) : <p className="text-sm text-zinc-400">연결된 신호가 없습니다. 자동 탐색을 먼저 실행하는 것을 권장합니다.</p>}
       </section>
 
-      <details className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+      <details className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
         <summary className="cursor-pointer list-none text-sm font-semibold text-zinc-700">고급 설정 · 심사 결과를 직접 수정할 때만 열기</summary>
         <p className="mt-2 text-xs leading-5 text-zinc-400">일반 사용에서는 건드리지 않아도 됩니다. 자동 평가가 명백히 잘못된 경우에만 보정하세요.</p>
 

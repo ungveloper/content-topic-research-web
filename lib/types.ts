@@ -42,6 +42,11 @@ export type ResearchEvidenceItem = {
   url?: string;
   publishedAt?: string;
   officialCandidate?: boolean;
+  similarCount?: number;
+  relatedQuestions?: Array<{
+    title: string;
+    url?: string;
+  }>;
 };
 
 export type ResearchEvidenceBundle = {
@@ -51,8 +56,15 @@ export type ResearchEvidenceBundle = {
   discoveredProblem: string;
   sourceSignalIds: string[];
   questions: ResearchEvidenceItem[];
+  questionStats: {
+    rawCount: number;
+    uniqueCount: number;
+    groupedCount: number;
+  };
   trend: {
     query: string;
+    keywords: string[];
+    comparisonBatch: number;
     recentAverage: number;
     series: Array<{ period: string; ratio: number }>;
     note: string;
