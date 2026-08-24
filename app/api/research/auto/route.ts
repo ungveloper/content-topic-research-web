@@ -30,6 +30,14 @@ const DISCOVERY_TYPES = [
   { type: "kin", path: "kin", kind: "naver-kin" as SignalKind, display: 30, sort: "sim" },
 ] as const;
 
+const DISCOVERY_LANES = [
+  // 최근 질문을 먼저 보되 날짜 기준을 하드 필터로 쓰지는 않습니다.
+  // NAVER 지식iN 검색 API는 질문 날짜를 안정적으로 반환하지 않으므로 sort=date를 "최근성 힌트"로 사용합니다.
+  { label: "recent", sort: "date" as const, display: 30, priorityBoost: 8 },
+  // 오래됐더라도 반복 검색되는 에버그린 문제를 놓치지 않기 위한 제한된 관련도 회수 레인입니다.
+  { label: "evergreen", sort: "sim" as const, display: 12, priorityBoost: 3 },
+] as const;
+
 const DETAIL_TYPES = [
   { type: "cafe", path: "cafearticle", kind: "naver-cafe" as SignalKind, display: 10, sort: "sim" },
   { type: "blog", path: "blog", kind: "naver-blog" as SignalKind, display: 10, sort: "sim" },
@@ -173,8 +181,30 @@ function trendScore(result?: TrendResult) {
     .map((point) => Number(point.ratio))
     .filter((value) => Number.isFinite(value));
   if (!ratios.length) return 0;
-  const recent = ratios.slice(-Math.min(4, ratios.length));
+  // 30일 일별 흐름 중 최근 7일을 "현재 수요" 힌트로 사용합니다.
+  // 이 값 하나로 후보를 탈락시키지 않고, 장기 지속성은 전체 30일 패턴을 ChatGPT Pro가 별도로 판단합니다.
+  const recent = ratios.slice(-Math.min(7, ratios.length));
   return Math.round(recent.reduce((sum, value) => sum + value, 0) / recent.length);
+}
+
+function trendDurabilityNote(result?: TrendResult) {
+  const ratios = (result?.data || [])
+    .map((point) => Number(point.ratio))
+    .filter((value) => Number.isFinite(value));
+  if (!ratios.length) return "30일 트렌드 데이터가 없어도 에버그린 후보를 자동 탈락시키지 않습니다.";
+
+  const activeDays = ratios.filter((value) => value > 0).length;
+  const activeRate = Math.round((activeDays / ratios.length) * 100);
+  const midpoint = Math.max(1, Math.floor(ratios.length / 2));
+  const first = ratios.slice(0, midpoint);
+  const second = ratios.slice(midpoint);
+  const average = (values: number[]) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+  const firstAvg = average(first);
+  const secondAvg = average(second);
+  const baseline = Math.max(1, (firstAvg + secondAvg) / 2);
+  const shift = Math.round((Math.abs(secondAvg - firstAvg) / baseline) * 100);
+
+  return `최근 30일 중 상대지수가 0보다 큰 날 ${activeRate}% · 전/후반 평균 변동폭 약 ${shift}%. 이 수치는 절대 검색량이 아니라 지속성 판단용 보조 힌트입니다.`;
 }
 
 function cleanProblemTitle(value: string) {
@@ -420,13 +450,15 @@ async function searchNaver(
   credentials: { clientId: string; clientSecret: string },
   query: string,
   config: SearchConfig,
+  options?: { sort?: "sim" | "date"; display?: number },
 ) {
   const endpoint = naverApiHubUrl(`/search/v1/${config.path}`);
   endpoint.searchParams.set("query", query);
-  endpoint.searchParams.set("display", String(config.display));
+  endpoint.searchParams.set("display", String(options?.display ?? config.display));
   endpoint.searchParams.set("start", "1");
   endpoint.searchParams.set("format", "json");
-  if ("sort" in config && config.sort) endpoint.searchParams.set("sort", config.sort);
+  const sort = options?.sort ?? ("sort" in config ? config.sort : undefined);
+  if (sort) endpoint.searchParams.set("sort", sort);
 
   const response = await fetch(endpoint, {
     headers: naverApiHubHeaders(credentials),
@@ -448,7 +480,8 @@ async function fetchTrendGroups(
   if (!groups.length) return [] as TrendResult[];
   const end = kstNow();
   const start = new Date(end);
-  start.setUTCDate(start.getUTCDate() - 90);
+  // 하루 1~3개 후보 선별에 맞춰 최근 흐름을 더 민감하게 보되, 이 30일은 하드 탈락 기준이 아닙니다.
+  start.setUTCDate(start.getUTCDate() - 30);
   const endpoint = naverApiHubUrl("/search-trend/v1/search");
   const results: TrendResult[] = [];
 
@@ -457,7 +490,7 @@ async function fetchTrendGroups(
     const body = {
       startDate: start.toISOString().slice(0, 10),
       endDate: end.toISOString().slice(0, 10),
-      timeUnit: "week",
+      timeUnit: "date",
       keywordGroups: batch.map((group) => ({
         groupName: group.groupName,
         keywords: group.keywords.slice(0, MAX_TREND_KEYWORDS_PER_GROUP),
@@ -608,18 +641,24 @@ export async function POST(request: NextRequest) {
     .filter((entry) => withinDays(entry.usedAt || entry.updatedAt, 60))
     .slice(-100);
 
-  // 1) 지식iN은 문제 발견만 담당합니다. 여기서는 명백한 잡음/금지 분야/최근 중복만 기계적으로 제거합니다.
+  // 1) 지식iN은 문제 발견만 담당합니다.
+  // 최근성은 "recent lane(sort=date)"으로 우선 반영하지만, 오래된 에버그린 문제를 버리지 않도록
+  // 제한된 "evergreen lane(sort=sim)"도 함께 회수합니다. 날짜는 가산점이지 하드 컷오프가 아닙니다.
   const discovered: DiscoveredProblem[] = [];
   for (const seed of seeds) {
+    const config = DISCOVERY_TYPES[0];
     const settled = await Promise.allSettled(
-      DISCOVERY_TYPES.map(async (config) => ({ config, items: await searchNaver(naverCredentials, seed.query, config) })),
+      DISCOVERY_LANES.map(async (lane) => ({
+        lane,
+        items: await searchNaver(naverCredentials, seed.query, config, { sort: lane.sort, display: lane.display }),
+      })),
     );
 
     settled.forEach((result, index) => {
-      const config = DISCOVERY_TYPES[index];
+      const lane = DISCOVERY_LANES[index];
       if (result.status === "rejected") {
         const message = result.reason instanceof Error ? result.reason.message : "검색 실패";
-        errors.push(`${autoResearchCategoryLabel(seed.category)} · ${config.type}: ${message}`);
+        errors.push(`${autoResearchCategoryLabel(seed.category)} · kin/${lane.label}: ${message}`);
         return;
       }
 
@@ -637,7 +676,7 @@ export async function POST(request: NextRequest) {
           rawTitle,
           kind: config.kind,
           item,
-          discoveryPriority: problemSignalPriority(rawTitle) + 5,
+          discoveryPriority: problemSignalPriority(rawTitle) + lane.priorityBoost,
         });
       });
     });
@@ -752,15 +791,16 @@ export async function POST(request: NextRequest) {
     const recentAverage = trendScore(trendResult);
     const trendSeries = (trendResult?.data || [])
       .filter((point) => point.period && Number.isFinite(Number(point.ratio)))
-      .slice(-16)
+      .slice(-30)
       .map((point) => ({ period: String(point.period), ratio: Number(point.ratio) }));
+    const durabilityNote = trendDurabilityNote(trendResult);
 
     const trendSignal: Signal = {
       id: makeId("signal"),
       kind: "naver-trends",
       title: `${cluster.title} 검색 의도군 수요 신호`,
       query: trendKeywords.join(" | "),
-      snippet: `관련 검색어군 ${trendKeywords.map((keyword) => `“${keyword}”`).join(", ")}을 묶어 본 최근 90일 주간 상대 검색지수의 최근 평균 ${recentAverage}/100. 정확한 장문 질의 하나의 0값을 곧바로 수요 없음으로 해석하지 않습니다.`,
+      snippet: `관련 검색어군 ${trendKeywords.map((keyword) => `“${keyword}”`).join(", ")}을 묶어 본 최근 30일 일별 상대 검색지수의 최근 7일 평균 ${recentAverage}/100. ${durabilityNote} 정확한 장문 질의 하나의 0값을 곧바로 수요 없음으로 해석하지 않습니다.`,
       sourceLabel: "NAVER 검색어트렌드",
       createdAt,
       metrics: { trendScore: recentAverage },
@@ -789,7 +829,7 @@ export async function POST(request: NextRequest) {
         comparisonBatch: trendBatchByQuery.get(cluster.title) || 1,
         recentAverage,
         series: trendSeries,
-        note: "NAVER 검색어트렌드의 0~100 상대지수입니다. 원 질문 한 문장이 아니라 관련 검색 의도군을 묶어 확인합니다. API 제한 때문에 최대 5개 후보씩 나눠 조회하므로 서로 다른 comparisonBatch의 ratio 절대값은 직접 비교하지 않습니다. 트렌드가 없다는 이유 하나만으로 후보를 탈락시키지 않습니다.",
+        note: `NAVER 검색어트렌드의 0~100 상대지수입니다. 최근 30일을 일 단위로 보고 최근 7일 평균은 현재 수요 힌트로만 사용합니다. ${durabilityNote} 원 질문 한 문장이 아니라 관련 검색 의도군을 묶어 확인합니다. API 제한 때문에 최대 5개 후보씩 나눠 조회하므로 서로 다른 comparisonBatch의 ratio 절대값은 직접 비교하지 않습니다. 최근성이 약하거나 트렌드가 없다는 이유 하나만으로 에버그린 후보를 탈락시키지 않습니다.`,
       },
       cafe: cafeItems.map((item) => makeEvidenceItem("naver-cafe", item)),
       blog: blogItems.map((item) => makeEvidenceItem("naver-blog", item)),
