@@ -1,4 +1,5 @@
 import type {
+  EditorialContext,
   ResearchEvidenceBundle,
   TopicReviewResult,
 } from "@/lib/types";
@@ -12,6 +13,7 @@ type ReviewPromptContext = {
     usedCount: number;
     seenCount: number;
   };
+  editorialContext?: EditorialContext;
 };
 
 function compactJson(value: unknown) {
@@ -26,6 +28,7 @@ export function buildTopicReviewPrompt(
     generatedAt: context.generatedAt,
     discoveryScopes: context.seeds,
     cooldown: context.cooldown || null,
+    editorialContext: context.editorialContext || null,
     bundles,
   });
 
@@ -54,6 +57,25 @@ export function buildTopicReviewPrompt(
 - 웹문서: 정부·공공기관·제조사·서비스 운영사 등 1차 근거 후보를 찾는 용도. officialCandidate=true여도 실제 공식 원문인지 다시 확인해야 한다
 
 중요: 각 API는 역할이 다르다. “보조 API 3개 이상 존재” 같은 기계적 통과 조건을 만들지 말고, 문제의 성격에 따라 어떤 근거가 실제로 필요한지 판단한다.
+
+[사이트 전체 편집 맥락 — 신규 글보다 중복 방지가 우선]
+입력 JSON의 editorialContext가 있으면 반드시 각 bundle의 기존 WordPress 글과 Search Console 실성과를 함께 본다.
+- editorialContext.bundles[].existingContentMatches는 앱이 제목/문제 토큰을 기계적으로 비교해 추린 “검토 후보”이지 최종 중복 판정이 아니다. URL을 보고 실제 검색 의도가 같은지 네가 의미적으로 판단한다.
+- likelyDuplicate=true면 신규 글을 바로 추천하지 않는다. 기존 글의 검색 의도와 새 문제의 최종 답이 사실상 같다면 hold하고 “기존 글 업데이트/통합”을 우선한다.
+- 기존 글과 대상 사용자, 조건, 최종 행동이 분명히 다르면 새 글을 허용할 수 있지만, 무엇이 다른지 rationale에 명시한다.
+- revalidationDue=true인 유사 기존 글이 있으면 새 글을 하나 더 만드는 것보다 해당 글을 최신 공식 원문으로 재검증·업데이트하는 편이 나은지 먼저 판단한다.
+- 90일 재검증 대상은 앱/OS/서비스/행정·정책처럼 변경 가능성이 높은 글, 180일 대상은 비교적 안정적인 에버그린 글을 뜻한다. 날짜가 지났다는 이유만으로 폐기하지 말고 “재확인이 필요한 기존 자산”으로 취급한다.
+
+[Search Console 실성과 피드백]
+- searchConsoleMatches가 있으면 Google이 이미 이 사이트와 연결한 실제 쿼리 신호로 사용한다. NAVER 수요보다 무조건 우선하는 것이 아니라 사이트 적합성 판단을 보강한다.
+- 노출이 있고 평균순위가 대략 5~30위인 관련 쿼리는 이미 주제 관련성이 형성된 “개선 기회”일 수 있다. 단, 기존 페이지가 그 의도를 이미 해결한다면 신규 글보다 기존 글 개선을 우선한다.
+- 클릭/노출이 낮다고 바로 버리지 않는다. 새 사이트·새 주제일 수 있고, 반대로 높은 노출도 단순 브랜드/무관 쿼리면 가산하지 않는다.
+- Search Console 데이터가 없으면 불이익을 주지 않는다.
+
+[하루 0~3개 포트폴리오 다양성]
+- 상위 3개를 모두 같은 기기·같은 서비스·같은 검색 의도 변형으로 채우지 않는다.
+- 품질이 비슷하다면 1~2개의 장기 에버그린 + 0~1개의 최근 변화/기회형처럼 서로 다른 문제군을 우선한다.
+- 다양성을 맞추기 위해 약한 후보를 끼워 넣지는 않는다. 1개만 강하면 1개만 추천한다.
 
 [하드 제외]
 다음 주제는 수요가 높아도 무조건 exclude로 판단한다.
@@ -209,8 +231,9 @@ scoreInputs는 앱 UI 호환을 위한 보조값이다. 0~5로 판단하되 최�
 1. 즉시 웹에서 최신 공식 원문을 다시 확인한다. 가능하면 정부·지자체·공공기관·제조사·서비스 운영사 원문을 우선한다.
 2. NAVER 블로그·카페·지식iN·뉴스의 문장을 사실 근거로 그대로 사용하지 않는다. 이들은 문제 발견·수요·변경 감지 신호로만 활용한다.
 3. 선정 단계의 verificationPlan을 실제로 수행하고 핵심 주장, 예외, 날짜·버전·지역 차이를 교차 확인한다.
-4. 공식 근거가 충분하면 별도의 “검증 보고서”를 먼저 출력하지 말고 바로 WordPress 발행용 완성 원고까지 작성한다. 검증 결과는 본문 논리와 근거에 자연스럽게 반영한다.
-5. 공식 근거가 예상보다 약하거나 서로 충돌해 안전하게 결론을 낼 수 없으면 억지로 쓰지 말고 [게시 보류]와 핵심 이유만 출력한다.
+4. editorialContext에 유사 기존 WordPress 글이 있으면 그 URL의 검색 의도와 새 원고의 의도를 마지막으로 다시 비교한다. 기존 글 업데이트로 충분하면 새 글을 만들지 말고 [게시 보류]와 “기존 글 업데이트 권장”을 출력한다.
+5. 공식 근거가 충분하고 신규 페이지의 독립 검색 의도가 명확하면 별도의 “검증 보고서”를 먼저 출력하지 말고 바로 WordPress 발행용 완성 원고까지 작성한다. 검증 결과는 본문 논리와 근거에 자연스럽게 반영한다.
+6. 공식 근거가 예상보다 약하거나 서로 충돌해 안전하게 결론을 낼 수 없으면 억지로 쓰지 말고 [게시 보류]와 핵심 이유만 출력한다.
 
 [direct-test 후보를 선택한 경우]
 1. 실제 측정값·스크린샷·사진·시간·실패 기록을 절대 상상하지 않는다.

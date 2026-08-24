@@ -82,6 +82,53 @@ export type ResearchEvidenceBundle = {
   };
 };
 
+
+export type SiteContentRecord = {
+  id: string;
+  title: string;
+  url: string;
+  slug?: string;
+  publishedAt?: string;
+  modifiedAt?: string;
+  revalidationWindowDays: 90 | 180;
+  revalidationDue: boolean;
+};
+
+export type ExistingContentMatch = {
+  title: string;
+  url: string;
+  similarity: number;
+  modifiedAt?: string;
+  revalidationWindowDays: 90 | 180;
+  revalidationDue: boolean;
+};
+
+export type SearchPerformanceMatch = {
+  query: string;
+  similarity: number;
+  clicks?: number;
+  impressions?: number;
+  ctr?: number;
+  position?: number;
+};
+
+export type EditorialBundleContext = {
+  bundleId: string;
+  existingContentMatches: ExistingContentMatch[];
+  searchConsoleMatches: SearchPerformanceMatch[];
+  likelyDuplicate: boolean;
+};
+
+export type EditorialContext = {
+  siteUrl?: string;
+  syncedAt?: string;
+  totalPublishedPosts: number;
+  revalidationDue90: number;
+  revalidationDue180: number;
+  searchConsoleQueryCount: number;
+  bundles: EditorialBundleContext[];
+};
+
 export type TopicReviewDecision =
   | "direct-test"
   | "research-verification"
@@ -177,6 +224,7 @@ export type Candidate = {
   uniqueOutput: string;
   verificationPlan: string;
   directEvidence: string;
+  editorialContext?: EditorialBundleContext;
   aiReview?: CandidateAiReview;
   createdAt: string;
   updatedAt: string;

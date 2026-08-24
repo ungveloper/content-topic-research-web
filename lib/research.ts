@@ -237,6 +237,14 @@ export function candidatePrompt(candidate: Candidate, signals: Signal[]) {
 - 항목별 평가: ${scoreSummary}
 - 감점 신호: ${penaltySummary}`;
 
+  const editorialContextSummary = candidate.editorialContext
+    ? `[사이트 전체 편집 맥락]
+- 기존 유사 글 후보: ${candidate.editorialContext.existingContentMatches.length ? candidate.editorialContext.existingContentMatches.map((item) => `${item.title} (${item.url}) · 유사도 ${Math.round(item.similarity * 100)}%${item.revalidationDue ? ` · ${item.revalidationWindowDays}일 재검증 대상` : ""}`).join(" / ") : "없음"}
+- Search Console 관련 쿼리: ${candidate.editorialContext.searchConsoleMatches.length ? candidate.editorialContext.searchConsoleMatches.map((item) => `${item.query}${typeof item.impressions === "number" ? ` · 노출 ${item.impressions}` : ""}${typeof item.clicks === "number" ? ` · 클릭 ${item.clicks}` : ""}${typeof item.position === "number" ? ` · 평균순위 ${item.position}` : ""}`).join(" / ") : "없음"}
+- 기계적 중복 경고: ${candidate.editorialContext.likelyDuplicate ? "있음 — 반드시 실제 검색 의도를 다시 비교하고 기존 글 업데이트 가능성을 우선 검토" : "없음 — 그래도 실제 의도 중복 여부는 최종 확인"}`
+    : `[사이트 전체 편집 맥락]
+- WordPress 기존 글/관련 Search Console 데이터가 이 후보에 연결되지 않았습니다. 신규 글 작성 전 같은 사이트의 기존 검색 의도와 실제 검색 결과를 직접 확인합니다.`;
+
   return `너는 단순 SEO 글 작성자가 아니라, 생활 문제를 실제로 해결할 수 있는 독창적 문서를 만드는 리서처·편집자다.
 
 목표는 Google AdSense 승인을 보장하는 것이 아니다. 대신 사이트 전체가 저가치·대량생산형 콘텐츠처럼 보이지 않도록, 사용자에게 실제 이유가 있는 페이지만 만들고 약한 주제는 발행하지 않는 것이다. 검색 유입도 키워드 반복이 아니라 문제 해결력·검증 가능한 근거·고유 결과물에서 만들어야 한다.
@@ -264,6 +272,8 @@ ${candidate.audience || "검색 의도와 문제 상황을 보고 네가 직접 
 ${candidate.siteTheme || "생활 문제 해결 기록소 · 디지털 생활 도구"}
 
 ${aiReviewSummary}
+
+${editorialContextSummary}
 
 [선정 단계에서 설계한 고유 결과물]
 ${candidate.uniqueOutput || "없음. 조사 결과를 바탕으로 네가 직접 설계"}
@@ -542,10 +552,11 @@ B. ‘증거’를 콘텐츠의 중심으로 둬라
 1. 핵심 사실이 실제 1차 원문으로 검증됨
 2. 검색자가 이 페이지에서만 얻을 수 있는 구체적 결과물이 있음
 3. 기존 검색 결과의 단순 재요약이 아님
-4. 같은 사이트의 다른 글과 검색 의도·판단 흐름이 충분히 다름
+4. 같은 사이트의 다른 글과 검색 의도·판단 흐름이 충분히 다름. 유사 기존 글이 있으면 신규 글보다 업데이트/통합이 더 나은지 실제 URL 기준으로 비교함
 5. 불필요한 반복과 숫자 채우기용 사례가 제거됨
 6. 제목·본문·SEO 메타데이터의 약속이 일치함
 7. 직접 경험·수치·출처·URL을 꾸며내지 않음
+8. 변경 가능성이 높은 주제는 기존 글의 마지막 수정·검증 시점을 확인하고, 90일/180일 재검증 대상이면 신규 URL보다 업데이트가 적절한지 판단함
 
 하나라도 핵심 조건이 부족하면 분량을 억지로 늘리지 말고 [보완 후 게시] 또는 [게시 보류]로 판정한다.
 

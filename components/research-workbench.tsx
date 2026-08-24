@@ -33,11 +33,13 @@ import { createSampleData } from "@/lib/sample-data";
 import type {
   Candidate,
   ContentMode,
+  EditorialContext,
   Penalties,
   ResearchEvidenceBundle,
   ScoreInputs,
   Signal,
   SignalKind,
+  SiteContentRecord,
   TopicReviewItem,
 } from "@/lib/types";
 
@@ -83,6 +85,7 @@ type AutoResearchResponse = {
   signals: Signal[];
   evidenceBundles: ResearchEvidenceBundle[];
   reviewPrompt: string;
+  editorialContext?: EditorialContext;
   errors?: string[];
   cooldown?: {
     usedDays: number;
@@ -90,10 +93,23 @@ type AutoResearchResponse = {
   };
 };
 
+type SiteContentSyncResponse = {
+  siteUrl: string;
+  syncedAt: string;
+  total: number;
+  revalidationDue90: number;
+  revalidationDue180: number;
+  contents: SiteContentRecord[];
+  error?: string;
+};
+
 const STORAGE_SIGNALS = "content-topic-research:signals:v1";
 const STORAGE_CANDIDATES = "content-topic-research:candidates:v1";
 const STORAGE_USED_TOPICS = "content-topic-research:used-topics:v1";
 const LEGACY_STORAGE_SEEN_TOPICS = "content-topic-research:seen-topics:v1";
+const STORAGE_SITE_URL = "content-topic-research:wordpress-site-url:v1";
+const STORAGE_SITE_CONTENTS = "content-topic-research:wordpress-site-contents:v1";
+const STORAGE_SITE_SYNCED_AT = "content-topic-research:wordpress-site-synced-at:v1";
 
 const SCORE_FIELDS: Array<{
   key: keyof ScoreInputs;
@@ -392,6 +408,12 @@ export function ResearchWorkbench() {
   const [autoReviewOutput, setAutoReviewOutput] = useState("");
   const [autoReviewPromptCopied, setAutoReviewPromptCopied] = useState(false);
   const [usedTopics, setUsedTopics] = useState<UsedTopicHistory[]>([]);
+  const [autoEditorialContext, setAutoEditorialContext] = useState<EditorialContext | null>(null);
+  const [siteUrl, setSiteUrl] = useState("");
+  const [siteContents, setSiteContents] = useState<SiteContentRecord[]>([]);
+  const [siteContentSyncedAt, setSiteContentSyncedAt] = useState("");
+  const [siteContentLoading, setSiteContentLoading] = useState(false);
+  const [siteContentError, setSiteContentError] = useState<string | null>(null);
 
   const [manualKind, setManualKind] = useState<SignalKind>("official");
   const [manualTitle, setManualTitle] = useState("");
@@ -407,12 +429,21 @@ export function ResearchWorkbench() {
       const storedSignals = window.localStorage.getItem(STORAGE_SIGNALS);
       const storedCandidates = window.localStorage.getItem(STORAGE_CANDIDATES);
       const storedUsedTopics = window.localStorage.getItem(STORAGE_USED_TOPICS);
+      const storedSiteUrl = window.localStorage.getItem(STORAGE_SITE_URL);
+      const storedSiteContents = window.localStorage.getItem(STORAGE_SITE_CONTENTS);
+      const storedSiteSyncedAt = window.localStorage.getItem(STORAGE_SITE_SYNCED_AT);
       if (storedSignals) setSignals(JSON.parse(storedSignals));
       if (storedCandidates) {
         const parsed = JSON.parse(storedCandidates) as Candidate[];
         setCandidates(Array.isArray(parsed) ? parsed.filter(isUsableCandidate) : []);
       }
       if (storedUsedTopics) setUsedTopics(JSON.parse(storedUsedTopics));
+      if (storedSiteUrl) setSiteUrl(storedSiteUrl);
+      if (storedSiteContents) {
+        const parsed = JSON.parse(storedSiteContents) as SiteContentRecord[];
+        if (Array.isArray(parsed)) setSiteContents(parsed);
+      }
+      if (storedSiteSyncedAt) setSiteContentSyncedAt(storedSiteSyncedAt);
       // 이전 버전의 14일 노출 차단 기록은 더 이상 사용하지 않습니다.
       window.localStorage.removeItem(LEGACY_STORAGE_SEEN_TOPICS);
     } catch {
@@ -441,6 +472,13 @@ export function ResearchWorkbench() {
     });
     window.localStorage.setItem(STORAGE_USED_TOPICS, JSON.stringify(recent));
   }, [usedTopics, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    window.localStorage.setItem(STORAGE_SITE_URL, siteUrl);
+    window.localStorage.setItem(STORAGE_SITE_CONTENTS, JSON.stringify(siteContents));
+    if (siteContentSyncedAt) window.localStorage.setItem(STORAGE_SITE_SYNCED_AT, siteContentSyncedAt);
+  }, [siteUrl, siteContents, siteContentSyncedAt, hydrated]);
 
 
   useEffect(() => {
@@ -485,6 +523,15 @@ export function ResearchWorkbench() {
   const activeCandidate = useMemo(
     () => visibleCandidates.find((candidate) => candidate.id === activeCandidateId) || null,
     [visibleCandidates, activeCandidateId],
+  );
+
+  const revalidationDueContents = useMemo(
+    () =>
+      [...siteContents]
+        .filter((item) => item.revalidationDue)
+        .sort((a, b) => new Date(a.modifiedAt || a.publishedAt || 0).getTime() - new Date(b.modifiedAt || b.publishedAt || 0).getTime())
+        .slice(0, 6),
+    [siteContents],
   );
 
   function loadSample() {
@@ -536,6 +583,7 @@ export function ResearchWorkbench() {
     setAutoReviewPrompt("");
     setAutoReviewOutput("");
     setAutoReviewPromptCopied(false);
+    setAutoEditorialContext(null);
     setAutoResearchError(null);
     setAutoResearchOffset(0);
     setManualTitle("");
@@ -634,6 +682,7 @@ export function ResearchWorkbench() {
       uniqueOutput: review.uniqueOutput.trim(),
       verificationPlan: review.verificationPlan.trim(),
       directEvidence: "",
+      editorialContext: autoEditorialContext?.bundles.find((item) => item.bundleId === bundle.id),
       aiReview: {
         decision: review.decision === "direct-test" ? "direct-test" : "research-verification",
         reviewedAt: createdAt,
@@ -649,6 +698,32 @@ export function ResearchWorkbench() {
       createdAt,
       updatedAt: createdAt,
     };
+  }
+
+  async function syncWordPressContent() {
+    if (!siteUrl.trim()) {
+      setSiteContentError("WordPress 사이트 URL을 입력해주세요.");
+      return;
+    }
+    setSiteContentLoading(true);
+    setSiteContentError(null);
+    try {
+      const response = await fetch("/api/site-content", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ siteUrl: siteUrl.trim(), maxPosts: 500 }),
+      });
+      const data = (await response.json()) as SiteContentSyncResponse;
+      if (!response.ok) throw new Error(data.error || "WordPress 글 목록을 가져오지 못했습니다.");
+      setSiteUrl(data.siteUrl);
+      setSiteContents(Array.isArray(data.contents) ? data.contents : []);
+      setSiteContentSyncedAt(data.syncedAt || new Date().toISOString());
+      setToast(`WordPress 게시글 ${data.total}개를 사이트 중복 검사 기준으로 동기화했습니다.`);
+    } catch (error) {
+      setSiteContentError(error instanceof Error ? error.message : "WordPress 글 목록을 가져오지 못했습니다.");
+    } finally {
+      setSiteContentLoading(false);
+    }
   }
 
   async function runAutoResearch(offset = 0) {
@@ -672,6 +747,18 @@ export function ResearchWorkbench() {
             problem: item.problem,
             usedAt: item.usedAt,
           })),
+          siteUrl: siteUrl.trim() || undefined,
+          siteContents: siteContents.slice(0, 500),
+          searchPerformance: signals
+            .filter((signal) => signal.kind === "search-console" && (signal.query || signal.title))
+            .slice(0, 500)
+            .map((signal) => ({
+              query: signal.query || signal.title,
+              clicks: signal.metrics?.clicks,
+              impressions: signal.metrics?.impressions,
+              ctr: signal.metrics?.ctr,
+              position: signal.metrics?.position,
+            })),
         }),
       });
       const data = (await response.json()) as AutoResearchResponse & { error?: string };
@@ -715,6 +802,7 @@ export function ResearchWorkbench() {
       setAutoResearchCooldown(data.cooldown || null);
       setAutoEvidenceBundles(normalizedBundles);
       setAutoReviewPrompt(typeof data.reviewPrompt === "string" ? data.reviewPrompt : "");
+      setAutoEditorialContext(data.editorialContext || null);
 
       if (normalizedBundles.length && data.reviewPrompt) {
         window.setTimeout(() => {
@@ -738,6 +826,13 @@ export function ResearchWorkbench() {
   }
 
   function reviewPromptForBundles(bundles: ResearchEvidenceBundle[]) {
+    const bundleIds = new Set(bundles.map((bundle) => bundle.id));
+    const editorialContext = autoEditorialContext
+      ? {
+          ...autoEditorialContext,
+          bundles: autoEditorialContext.bundles.filter((item) => bundleIds.has(item.bundleId)),
+        }
+      : undefined;
     return buildTopicReviewPrompt(bundles, {
       generatedAt: new Date().toISOString(),
       seeds: autoResearchSeeds,
@@ -747,6 +842,7 @@ export function ResearchWorkbench() {
         usedCount: autoResearchCooldown?.usedCount ?? 0,
         seenCount: 0,
       },
+      editorialContext,
     });
   }
 
@@ -935,8 +1031,10 @@ export function ResearchWorkbench() {
         },
       }));
 
-    setSignals((current) => [...imported, ...current]);
-    setToast(`Search Console 검색어 ${imported.length}개를 불러왔습니다.`);
+    // Search Console은 누적 로그가 아니라 현재 사이트 성과 스냅샷으로 사용합니다.
+    // 새 CSV를 가져오면 이전 Search Console 신호는 교체하고 다른 조사 신호만 유지합니다.
+    setSignals((current) => [...imported, ...current.filter((signal) => signal.kind !== "search-console")]);
+    setToast(`Search Console 검색어 ${imported.length}개를 최신 성과 스냅샷으로 불러왔습니다.`);
   }
 
   function toggleSignal(id: string) {
@@ -1503,6 +1601,57 @@ export function ResearchWorkbench() {
                   </button>
                 </section>
               </div>
+
+              <section className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+                <SectionTitle
+                  eyebrow="Site Guard"
+                  title="기존 WordPress 글과 신규 후보 중복 검사"
+                  description="공개 WordPress REST API에서 현재 발행된 글 제목·URL·수정일을 가져와 신규 후보와 검색 의도를 비교합니다. 앱/서비스·생활 행정처럼 변경 가능성이 높은 글은 90일, 안정적인 에버그린 글은 180일을 재검증 힌트로 사용하며 날짜만으로 글을 폐기하지 않습니다."
+                />
+                <div className="grid min-w-0 gap-3 lg:grid-cols-[minmax(0,1fr)_180px]">
+                  <input
+                    value={siteUrl}
+                    onChange={(event) => setSiteUrl(event.target.value)}
+                    onKeyDown={(event) => { if (event.key === "Enter") void syncWordPressContent(); }}
+                    placeholder="https://example.com"
+                    className="min-w-0 rounded-xl border border-zinc-200 px-3 py-3 text-sm outline-none placeholder:text-zinc-300 focus:border-zinc-400"
+                  />
+                  <button type="button" onClick={() => void syncWordPressContent()} disabled={siteContentLoading} className="rounded-xl bg-zinc-900 px-4 py-3 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:opacity-50">
+                    {siteContentLoading ? "동기화 중" : "기존 글 동기화"}
+                  </button>
+                </div>
+                {siteContentError ? <div className="mt-3 rounded-xl bg-rose-50 px-4 py-3 text-xs leading-5 text-rose-700">{siteContentError}</div> : null}
+                {siteContents.length ? (
+                  <div className="mt-4 grid min-w-0 gap-3 sm:grid-cols-3">
+                    <div className="min-w-0 rounded-xl bg-zinc-50 p-3">
+                      <div className="text-[10px] font-medium text-zinc-400">동기화된 기존 글</div>
+                      <div className="mt-1 text-lg font-semibold text-zinc-800">{siteContents.length}개</div>
+                    </div>
+                    <div className="min-w-0 rounded-xl bg-amber-50 p-3">
+                      <div className="text-[10px] font-medium text-amber-700">90일 재검증 힌트</div>
+                      <div className="mt-1 text-lg font-semibold text-amber-900">{siteContents.filter((item) => item.revalidationWindowDays === 90 && item.revalidationDue).length}개</div>
+                    </div>
+                    <div className="min-w-0 rounded-xl bg-zinc-50 p-3">
+                      <div className="text-[10px] font-medium text-zinc-400">180일 재검증 힌트</div>
+                      <div className="mt-1 text-lg font-semibold text-zinc-800">{siteContents.filter((item) => item.revalidationWindowDays === 180 && item.revalidationDue).length}개</div>
+                    </div>
+                  </div>
+                ) : null}
+                {revalidationDueContents.length ? (
+                  <div className="mt-4 min-w-0 rounded-xl border border-zinc-200 p-3">
+                    <div className="text-[11px] font-semibold text-zinc-700">재검증 우선 기존 글</div>
+                    <div className="mt-2 space-y-2">
+                      {revalidationDueContents.map((item) => (
+                        <div key={item.id} className="flex min-w-0 items-start justify-between gap-3 text-[11px] leading-5">
+                          <a href={item.url} target="_blank" rel="noreferrer" className="min-w-0 break-words text-zinc-600 hover:text-zinc-900 [overflow-wrap:anywhere]">{item.title}</a>
+                          <span className="shrink-0 rounded-md bg-zinc-100 px-2 py-0.5 text-[10px] font-medium text-zinc-500">{item.revalidationWindowDays}일</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+                {siteContentSyncedAt ? <p className="mt-3 break-words text-[11px] leading-5 text-zinc-400">마지막 동기화 {formatDate(siteContentSyncedAt)} · 신규 글을 무조건 막는 기준이 아니라 기존 글 업데이트/통합 여부를 ChatGPT Pro가 판단하는 편집 맥락으로 사용합니다.</p> : null}
+              </section>
 
               <section>
                 <div className="mb-4 flex flex-wrap items-end justify-between gap-3">

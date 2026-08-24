@@ -20,10 +20,12 @@ import {
 import { isExcludedContentTopic, makeId, stripHtml } from "@/lib/research";
 import { buildTopicReviewPrompt } from "@/lib/topic-review";
 import type {
+  EditorialContext,
   ResearchEvidenceBundle,
   ResearchEvidenceItem,
   Signal,
   SignalKind,
+  SiteContentRecord,
 } from "@/lib/types";
 
 const DISCOVERY_TYPES = [
@@ -82,9 +84,20 @@ type TopicHistory = {
   updatedAt?: string;
 };
 
+type SearchPerformanceInput = {
+  query?: string;
+  clicks?: number;
+  impressions?: number;
+  ctr?: number;
+  position?: number;
+};
+
 type AutoRequest = {
   offset?: number;
   usedTopics?: TopicHistory[];
+  siteUrl?: string;
+  siteContents?: SiteContentRecord[];
+  searchPerformance?: SearchPerformanceInput[];
 };
 
 type DiscoveredProblem = {
@@ -132,10 +145,15 @@ const OFFICIAL_HOSTS = [
   "lg.com",
   "apple.com",
   "support.google.com",
-  "microsoft.com",
+  "support.microsoft.com",
+  "learn.microsoft.com",
   "meta.com",
   "facebook.com",
-  "naver.com",
+  // naver.com 전체를 공식으로 보지 않습니다. 운영 주체의 도움말·정책·개발 문서만 후보로 인정합니다.
+  "help.naver.com",
+  "policy.naver.com",
+  "developers.naver.com",
+  "searchadvisor.naver.com",
 ];
 
 const DIVERSITY_THEMES = new Set([
@@ -164,6 +182,99 @@ function isOfficialUrl(value?: string) {
   if (!hostname) return false;
   if (hostname.endsWith(".go.kr")) return true;
   return OFFICIAL_HOSTS.some((host) => hostname === host || hostname.endsWith(`.${host}`));
+}
+
+function safeNumber(value: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function isRevalidationDue(item: SiteContentRecord) {
+  const reference = item.modifiedAt || item.publishedAt;
+  const time = reference ? new Date(reference).getTime() : Number.NaN;
+  if (!Number.isFinite(time)) return true;
+  const ageDays = Math.max(0, (Date.now() - time) / 86_400_000);
+  return ageDays >= item.revalidationWindowDays;
+}
+
+function buildEditorialContext(
+  bundles: ResearchEvidenceBundle[],
+  siteUrl: string | undefined,
+  siteContents: SiteContentRecord[],
+  searchPerformance: SearchPerformanceInput[],
+): EditorialContext {
+  const normalizedSiteContents = siteContents
+    .filter((item) => item && typeof item.title === "string" && item.title.trim() && typeof item.url === "string" && item.url.trim())
+    .slice(0, 500);
+  const normalizedPerformance = searchPerformance
+    .filter((item) => typeof item?.query === "string" && item.query.trim())
+    .slice(0, 500);
+
+  const bundleContexts = bundles.map((bundle) => {
+    const existingContentMatches = normalizedSiteContents
+      .map((item) => ({
+        item,
+        similarity: topicSimilarity(`${bundle.query} ${bundle.discoveredProblem}`, item.title),
+      }))
+      .filter((entry) => entry.similarity >= 0.2)
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, 5)
+      .map(({ item, similarity }) => ({
+        title: item.title,
+        url: item.url,
+        similarity: Math.round(similarity * 100) / 100,
+        modifiedAt: item.modifiedAt,
+        revalidationWindowDays: item.revalidationWindowDays,
+        revalidationDue: isRevalidationDue(item),
+      }));
+
+    const searchConsoleMatches = normalizedPerformance
+      .map((item) => ({
+        item,
+        similarity: topicSimilarity(`${bundle.query} ${bundle.discoveredProblem}`, item.query || ""),
+      }))
+      .filter((entry) => entry.similarity >= 0.16)
+      .sort((a, b) => {
+        const similarityDiff = b.similarity - a.similarity;
+        if (Math.abs(similarityDiff) > 0.05) return similarityDiff;
+        return (safeNumber(b.item.impressions) || 0) - (safeNumber(a.item.impressions) || 0);
+      })
+      .slice(0, 6)
+      .map(({ item, similarity }) => ({
+        query: item.query || "",
+        similarity: Math.round(similarity * 100) / 100,
+        clicks: safeNumber(item.clicks),
+        impressions: safeNumber(item.impressions),
+        ctr: safeNumber(item.ctr),
+        position: safeNumber(item.position),
+      }));
+
+    const strongest = existingContentMatches[0]?.similarity || 0;
+    const currentEntity = topicEntity(bundle.query);
+    const currentTheme = topicTheme(bundle.query);
+    const likelyDuplicate = strongest >= 0.72 || existingContentMatches.some((match) => {
+      const existingEntity = topicEntity(match.title);
+      const existingTheme = topicTheme(match.title);
+      return Boolean(currentEntity && currentEntity === existingEntity && currentTheme && currentTheme === existingTheme && match.similarity >= 0.48);
+    });
+
+    return {
+      bundleId: bundle.id,
+      existingContentMatches,
+      searchConsoleMatches,
+      likelyDuplicate,
+    };
+  });
+
+  return {
+    siteUrl: siteUrl?.trim() || undefined,
+    syncedAt: new Date().toISOString(),
+    totalPublishedPosts: normalizedSiteContents.length,
+    revalidationDue90: normalizedSiteContents.filter((item) => item.revalidationWindowDays === 90 && isRevalidationDue(item)).length,
+    revalidationDue180: normalizedSiteContents.filter((item) => item.revalidationWindowDays === 180 && isRevalidationDue(item)).length,
+    searchConsoleQueryCount: normalizedPerformance.length,
+    bundles: bundleContexts,
+  };
 }
 
 function problemSignalPriority(title: string) {
@@ -631,6 +742,8 @@ export async function POST(request: NextRequest) {
   const naverCredentials: { clientId: string; clientSecret: string } = credentials;
 
   const offset = Math.max(0, Math.min(20, Number(body.offset) || 0));
+  const siteContents = (Array.isArray(body.siteContents) ? body.siteContents : []).slice(0, 500);
+  const searchPerformance = (Array.isArray(body.searchPerformance) ? body.searchPerformance : []).slice(0, 500);
   const now = kstNow();
   const createdAt = new Date().toISOString();
   const seeds = getAutoResearchSeeds(now, offset, 5);
@@ -701,6 +814,7 @@ export async function POST(request: NextRequest) {
       signals: [],
       evidenceBundles: [],
       reviewPrompt: "",
+      editorialContext: buildEditorialContext([], body.siteUrl, siteContents, searchPerformance),
       errors: [
         ...Array.from(new Set(errors)),
         `지식iN 검색은 완료됐지만 독립 질문 후보가 남지 않았습니다. 원시 발견 ${discovered.length}건 중 중복·금지 분야·실제 사용한 최근 주제만 제외했습니다. 단순 노출 이력은 더 이상 차단하지 않습니다.`,
@@ -856,10 +970,17 @@ export async function POST(request: NextRequest) {
     });
   }
 
+  const editorialContext = buildEditorialContext(
+    evidenceBundles,
+    body.siteUrl,
+    siteContents,
+    searchPerformance,
+  );
   const reviewPrompt = buildTopicReviewPrompt(evidenceBundles, {
     generatedAt: createdAt,
     seeds: seedSummary,
     cooldown,
+    editorialContext,
   });
 
   return NextResponse.json({
@@ -869,6 +990,7 @@ export async function POST(request: NextRequest) {
     signals: allSignals,
     evidenceBundles,
     reviewPrompt,
+    editorialContext,
     errors: Array.from(new Set(errors)).slice(0, 12),
     cooldown,
   });
