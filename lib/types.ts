@@ -16,6 +16,105 @@ export type ContentMode =
   | "research-verification"
   | "comparison-analysis";
 
+export type ValidationStrategy = "direct-test" | "research-verification";
+
+export type ExperimentPlan = {
+  recommended: boolean;
+  durationDays: number;
+  metrics: string[];
+  plan: string;
+  completionRule: string;
+};
+
+export type ReviewLevel = "high" | "medium" | "low";
+
+export type FixedContentCategory =
+  | "집 관리"
+  | "디지털 생활"
+  | "생활 행정"
+  | "정리·보관"
+  | "제품 사용";
+
+export type ResearchEvidenceItem = {
+  source: "naver-kin" | "naver-cafe" | "naver-blog" | "naver-news" | "naver-web";
+  title: string;
+  snippet?: string;
+  url?: string;
+  publishedAt?: string;
+  officialCandidate?: boolean;
+};
+
+export type ResearchEvidenceBundle = {
+  id: string;
+  query: string;
+  discoveryCategory: string;
+  discoveredProblem: string;
+  sourceSignalIds: string[];
+  questions: ResearchEvidenceItem[];
+  trend: {
+    query: string;
+    recentAverage: number;
+    series: Array<{ period: string; ratio: number }>;
+    note: string;
+  };
+  cafe: ResearchEvidenceItem[];
+  blog: ResearchEvidenceItem[];
+  news: ResearchEvidenceItem[];
+  web: ResearchEvidenceItem[];
+  coverage: {
+    trend: boolean;
+    cafe: boolean;
+    blog: boolean;
+    news: boolean;
+    web: boolean;
+  };
+};
+
+export type TopicReviewDecision =
+  | "direct-test"
+  | "research-verification"
+  | "hold"
+  | "exclude";
+
+export type TopicReviewItem = {
+  bundleId: string;
+  decision: TopicReviewDecision;
+  title: string;
+  problem: string;
+  audience: string;
+  category: FixedContentCategory;
+  contentMode: ContentMode;
+  searchIntent: string;
+  trafficPotential: ReviewLevel;
+  repeatedDemand: ReviewLevel;
+  contentSaturation: ReviewLevel;
+  evidenceQuality: ReviewLevel;
+  originalityPotential: ReviewLevel;
+  rationale: string;
+  uniqueOutput: string;
+  verificationPlan: string;
+  scoreInputs: ScoreInputs;
+  experimentPlan?: ExperimentPlan | null;
+};
+
+export type TopicReviewResult = {
+  reviewSummary?: string;
+  reviews: TopicReviewItem[];
+};
+
+export type CandidateAiReview = {
+  decision: "direct-test" | "research-verification";
+  reviewedAt: string;
+  category: FixedContentCategory;
+  searchIntent: string;
+  trafficPotential: ReviewLevel;
+  repeatedDemand: ReviewLevel;
+  contentSaturation: ReviewLevel;
+  evidenceQuality: ReviewLevel;
+  originalityPotential: ReviewLevel;
+  rationale: string;
+};
+
 export type Signal = {
   id: string;
   kind: SignalKind;
@@ -58,12 +157,15 @@ export type Candidate = {
   audience: string;
   siteTheme: string;
   contentMode: ContentMode;
+  validationStrategy?: ValidationStrategy;
+  experimentPlan?: ExperimentPlan;
   sourceSignalIds: string[];
   scoreInputs: ScoreInputs;
   penalties: Penalties;
   uniqueOutput: string;
   verificationPlan: string;
   directEvidence: string;
+  aiReview?: CandidateAiReview;
   createdAt: string;
   updatedAt: string;
 };

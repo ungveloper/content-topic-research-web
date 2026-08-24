@@ -18,21 +18,27 @@ import {
   CONTENT_MODE_LABELS,
   SIGNAL_LABELS,
   candidatePrompt,
+  candidateTestPlanPrompt,
   defaultCandidate,
+  hasDirectTestEvidence,
+  isExcludedContentTopic,
   makeId,
   scoreCandidate,
   signalRole,
   stripHtml,
   verdict,
 } from "@/lib/research";
+import { parseTopicReviewOutput } from "@/lib/topic-review";
 import { createSampleData } from "@/lib/sample-data";
 import type {
   Candidate,
   ContentMode,
   Penalties,
+  ResearchEvidenceBundle,
   ScoreInputs,
   Signal,
   SignalKind,
+  TopicReviewItem,
 } from "@/lib/types";
 
 type Tab = "discover" | "candidates" | "prompt";
@@ -70,12 +76,19 @@ type UsedTopicHistory = {
   usedAt: string;
 };
 
+type SeenTopicHistory = {
+  title: string;
+  problem?: string;
+  seenAt: string;
+};
+
 type AutoResearchResponse = {
   generatedAt: string;
   offset: number;
   seeds: AutoResearchSeedSummary[];
   signals: Signal[];
-  candidates: Candidate[];
+  evidenceBundles: ResearchEvidenceBundle[];
+  reviewPrompt: string;
   errors?: string[];
   cooldown?: {
     usedDays: number;
@@ -88,6 +101,7 @@ type AutoResearchResponse = {
 const STORAGE_SIGNALS = "content-topic-research:signals:v1";
 const STORAGE_CANDIDATES = "content-topic-research:candidates:v1";
 const STORAGE_USED_TOPICS = "content-topic-research:used-topics:v1";
+const STORAGE_SEEN_TOPICS = "content-topic-research:seen-topics:v1";
 
 const SCORE_FIELDS: Array<{
   key: keyof ScoreInputs;
@@ -96,7 +110,7 @@ const SCORE_FIELDS: Array<{
 }> = [
   { key: "siteFit", label: "사이트 주제 적합성", hint: "내 사이트의 기존 독자와 연결되는가" },
   { key: "problemSpecificity", label: "문제의 구체성", hint: "‘했는데/갑자기/계속’처럼 막힌 지점이 분명한가" },
-  { key: "demand", label: "검색 수요", hint: "실제 수요 신호가 확인되는가" },
+  { key: "demand", label: "검색 유입 가능성", hint: "검색어트렌드와 반복 질문에서 실제 수요가 확인되는가" },
   { key: "officialEvidence", label: "공식 근거", hint: "원문·제조사·공공기관으로 검증 가능한가" },
   { key: "originalValue", label: "고유 분석 가능성", hint: "비교표·판단 흐름·도구·데이터를 새로 만들 수 있는가" },
   { key: "evergreen", label: "지속성", hint: "일회성 이슈가 아니라 계속 검색될 문제인가" },
@@ -131,6 +145,20 @@ const NAVER_TYPES: Array<{ value: NaverType; label: string; kind: SignalKind }> 
 
 function classNames(...values: Array<string | false | undefined>) {
   return values.filter(Boolean).join(" ");
+}
+
+function reviewLevelLabel(value: "high" | "medium" | "low") {
+  return value === "high" ? "높음" : value === "medium" ? "중간" : "낮음";
+}
+
+function needsDirectTest(candidate: Candidate) {
+  return Boolean(candidate.experimentPlan?.recommended) && !hasDirectTestEvidence(candidate);
+}
+
+function promptForCandidate(candidate: Candidate, signals: Signal[]) {
+  return needsDirectTest(candidate)
+    ? candidateTestPlanPrompt(candidate, signals)
+    : candidatePrompt(candidate, signals);
 }
 
 function parseCsv(text: string) {
@@ -191,6 +219,16 @@ function formatDate(value: string) {
   } catch {
     return value;
   }
+}
+
+function isUsableCandidate(candidate: Candidate) {
+  return Boolean(
+    candidate &&
+    candidate.title?.trim() &&
+    !isExcludedContentTopic(`${candidate.title} ${candidate.problem || ""}`) &&
+    Array.isArray(candidate.sourceSignalIds) &&
+    candidate.sourceSignalIds.length > 0,
+  );
 }
 
 function Badge({ children, tone = "neutral" }: { children: ReactNode; tone?: "neutral" | "good" | "warn" | "bad" | "blue" }) {
@@ -293,21 +331,31 @@ function SignalCard({
 function CandidateCard({ candidate, active, onOpen, onDelete }: { candidate: Candidate; active: boolean; onOpen: () => void; onDelete: () => void }) {
   const score = scoreCandidate(candidate);
   const result = verdict(score);
+  const aiReview = candidate.aiReview;
   return (
     <article className={classNames("group rounded-2xl border bg-white p-4 transition", active ? "border-zinc-900 shadow-sm" : "border-zinc-200 hover:border-zinc-300")}> 
       <button type="button" onClick={onOpen} className="w-full text-left">
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">
             <div className="mb-2 flex flex-wrap gap-2">
-              <Badge tone={result.tone}>{result.label}</Badge>
-              <Badge>{CONTENT_MODE_LABELS[candidate.contentMode]}</Badge>
+              {aiReview ? <Badge tone="good">ChatGPT Pro 선정</Badge> : <Badge tone={result.tone}>{result.label}</Badge>}
+              <Badge>{candidate.experimentPlan?.recommended ? `직접 테스트 · ${candidate.experimentPlan.durationDays}일` : CONTENT_MODE_LABELS[candidate.contentMode]}</Badge>
             </div>
             <h3 className="font-semibold leading-6 text-zinc-900">{candidate.title || "제목 없는 후보"}</h3>
             <p className="mt-1 line-clamp-2 text-xs leading-5 text-zinc-500">{candidate.problem || "해결하려는 문제를 입력하세요."}</p>
           </div>
-          <div className="text-right">
-            <div className="text-2xl font-semibold tracking-[-0.04em] text-zinc-900">{score}</div>
-            <div className="text-[10px] uppercase tracking-wider text-zinc-400">score</div>
+          <div className="shrink-0 text-right">
+            {aiReview ? (
+              <>
+                <div className="text-sm font-semibold text-zinc-900">{reviewLevelLabel(aiReview.trafficPotential)}</div>
+                <div className="mt-1 text-[10px] uppercase tracking-wider text-zinc-400">유입 기대</div>
+              </>
+            ) : (
+              <>
+                <div className="text-2xl font-semibold tracking-[-0.04em] text-zinc-900">{score}</div>
+                <div className="text-[10px] uppercase tracking-wider text-zinc-400">score</div>
+              </>
+            )}
           </div>
         </div>
       </button>
@@ -347,7 +395,11 @@ export function ResearchWorkbench() {
   const [autoResearchSeeds, setAutoResearchSeeds] = useState<AutoResearchSeedSummary[]>([]);
   const [autoResearchWarnings, setAutoResearchWarnings] = useState<string[]>([]);
   const [autoResearchCooldown, setAutoResearchCooldown] = useState<AutoResearchResponse["cooldown"] | null>(null);
+  const [autoEvidenceBundles, setAutoEvidenceBundles] = useState<ResearchEvidenceBundle[]>([]);
+  const [autoReviewPrompt, setAutoReviewPrompt] = useState("");
+  const [autoReviewOutput, setAutoReviewOutput] = useState("");
   const [usedTopics, setUsedTopics] = useState<UsedTopicHistory[]>([]);
+  const [seenTopics, setSeenTopics] = useState<SeenTopicHistory[]>([]);
 
   const [manualKind, setManualKind] = useState<SignalKind>("official");
   const [manualTitle, setManualTitle] = useState("");
@@ -363,9 +415,14 @@ export function ResearchWorkbench() {
       const storedSignals = window.localStorage.getItem(STORAGE_SIGNALS);
       const storedCandidates = window.localStorage.getItem(STORAGE_CANDIDATES);
       const storedUsedTopics = window.localStorage.getItem(STORAGE_USED_TOPICS);
+      const storedSeenTopics = window.localStorage.getItem(STORAGE_SEEN_TOPICS);
       if (storedSignals) setSignals(JSON.parse(storedSignals));
-      if (storedCandidates) setCandidates(JSON.parse(storedCandidates));
+      if (storedCandidates) {
+        const parsed = JSON.parse(storedCandidates) as Candidate[];
+        setCandidates(Array.isArray(parsed) ? parsed.filter(isUsableCandidate) : []);
+      }
       if (storedUsedTopics) setUsedTopics(JSON.parse(storedUsedTopics));
+      if (storedSeenTopics) setSeenTopics(JSON.parse(storedSeenTopics));
     } catch {
       // 손상된 로컬 데이터가 있어도 앱은 빈 상태로 시작합니다.
     } finally {
@@ -394,15 +451,20 @@ export function ResearchWorkbench() {
   }, [usedTopics, hydrated]);
 
   useEffect(() => {
+    if (!hydrated) return;
+    const cutoff = Date.now() - 30 * 86_400_000;
+    const recent = seenTopics.filter((item) => {
+      const time = new Date(item.seenAt).getTime();
+      return Number.isFinite(time) && time >= cutoff;
+    });
+    window.localStorage.setItem(STORAGE_SEEN_TOPICS, JSON.stringify(recent));
+  }, [seenTopics, hydrated]);
+
+  useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(null), 2200);
     return () => window.clearTimeout(timer);
   }, [toast]);
-
-  const activeCandidate = useMemo(
-    () => candidates.find((candidate) => candidate.id === activeCandidateId) || null,
-    [candidates, activeCandidateId],
-  );
 
   const sortedCandidates = useMemo(
     () =>
@@ -414,12 +476,27 @@ export function ResearchWorkbench() {
     [candidates],
   );
 
-  const dashboard = useMemo(() => {
-    const approved = candidates.filter((candidate) => scoreCandidate(candidate) >= 78).length;
-    const hold = candidates.filter((candidate) => scoreCandidate(candidate) < 60).length;
-    const official = signals.filter((signal) => signal.kind === "official").length;
-    return { approved, hold, official };
-  }, [candidates, signals]);
+  const visibleCandidates = useMemo(() => {
+    const usedKeys = new Set(
+      usedTopics
+        .flatMap((item) => [item.title, item.problem || ""])
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean),
+    );
+
+    return sortedCandidates.filter((candidate) => {
+      if (!isUsableCandidate(candidate)) return false;
+      if (!candidate.aiReview && scoreCandidate(candidate) < 60) return false;
+      const titleKey = candidate.title.trim().toLowerCase();
+      const problemKey = (candidate.problem || "").trim().toLowerCase();
+      return !usedKeys.has(titleKey) && (!problemKey || !usedKeys.has(problemKey));
+    });
+  }, [sortedCandidates, usedTopics]);
+
+  const activeCandidate = useMemo(
+    () => visibleCandidates.find((candidate) => candidate.id === activeCandidateId) || null,
+    [visibleCandidates, activeCandidateId],
+  );
 
   function loadSample() {
     const sample = createSampleData();
@@ -441,6 +518,9 @@ export function ResearchWorkbench() {
     setAutoResearchSeeds([]);
     setAutoResearchWarnings([]);
     setAutoResearchCooldown(null);
+    setAutoEvidenceBundles([]);
+    setAutoReviewPrompt("");
+    setAutoReviewOutput("");
     setAutoResearchError(null);
     setAutoResearchOffset(0);
     window.localStorage.removeItem(STORAGE_SIGNALS);
@@ -458,6 +538,9 @@ export function ResearchWorkbench() {
       naverTrendKeywords.trim() ||
       naverTrendResults.length ||
       autoResearchSeeds.length ||
+      autoEvidenceBundles.length ||
+      autoReviewPrompt.trim() ||
+      autoReviewOutput.trim() ||
       manualTitle.trim() ||
       manualUrl.trim() ||
       manualNote.trim(),
@@ -479,6 +562,9 @@ export function ResearchWorkbench() {
     setAutoResearchSeeds([]);
     setAutoResearchWarnings([]);
     setAutoResearchCooldown(null);
+    setAutoEvidenceBundles([]);
+    setAutoReviewPrompt("");
+    setAutoReviewOutput("");
     setAutoResearchError(null);
     setAutoResearchOffset(0);
     setManualTitle("");
@@ -535,11 +621,73 @@ export function ResearchWorkbench() {
     setManualNote("");
   }
 
+  async function writeClipboard(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      document.execCommand("copy");
+      textarea.remove();
+    }
+  }
+
+  function candidateFromTopicReview(review: TopicReviewItem, bundle: ResearchEvidenceBundle): Candidate {
+    const createdAt = new Date().toISOString();
+    return {
+      id: makeId("candidate"),
+      title: review.title.trim(),
+      problem: review.problem.trim(),
+      audience: review.audience.trim(),
+      siteTheme: "생활 문제 해결 기록소 · 디지털 생활 도구",
+      contentMode: review.contentMode,
+      validationStrategy: review.decision === "direct-test" ? "direct-test" : "research-verification",
+      experimentPlan:
+        review.decision === "direct-test" && review.experimentPlan
+          ? { ...review.experimentPlan, recommended: true }
+          : undefined,
+      sourceSignalIds: bundle.sourceSignalIds,
+      scoreInputs: review.scoreInputs,
+      penalties: {
+        ymyl: false,
+        newsRewrite: false,
+        duplicate: false,
+        aiCommodity: false,
+        weakEvidence: review.evidenceQuality === "low",
+      },
+      uniqueOutput: review.uniqueOutput.trim(),
+      verificationPlan: review.verificationPlan.trim(),
+      directEvidence: "",
+      aiReview: {
+        decision: review.decision === "direct-test" ? "direct-test" : "research-verification",
+        reviewedAt: createdAt,
+        category: review.category,
+        searchIntent: review.searchIntent.trim(),
+        trafficPotential: review.trafficPotential,
+        repeatedDemand: review.repeatedDemand,
+        contentSaturation: review.contentSaturation,
+        evidenceQuality: review.evidenceQuality,
+        originalityPotential: review.originalityPotential,
+        rationale: review.rationale.trim(),
+      },
+      createdAt,
+      updatedAt: createdAt,
+    };
+  }
+
   async function runAutoResearch(offset = 0) {
     setAutoResearchLoading(true);
     setAutoResearchError(null);
     setAutoResearchWarnings([]);
     setAutoResearchCooldown(null);
+    setAutoEvidenceBundles([]);
+    setAutoReviewPrompt("");
+    setAutoReviewOutput("");
 
     try {
       const response = await fetch("/api/research/auto", {
@@ -552,21 +700,28 @@ export function ResearchWorkbench() {
             problem: item.problem,
             usedAt: item.usedAt,
           })),
-          seenTopics: candidates.map((candidate) => ({
-            title: candidate.title,
-            problem: candidate.problem,
-            updatedAt: candidate.updatedAt,
-          })),
+          seenTopics: [
+            ...seenTopics.map((item) => ({
+              title: item.title,
+              problem: item.problem,
+              updatedAt: item.seenAt,
+            })),
+            ...candidates.map((candidate) => ({
+              title: candidate.title,
+              problem: candidate.problem,
+              updatedAt: candidate.updatedAt,
+            })),
+          ],
         }),
       });
       const data = (await response.json()) as AutoResearchResponse & { error?: string };
 
       if (!response.ok) {
-        throw new Error(data.error || "자동 탐색에 실패했습니다.");
+        throw new Error(data.error || "조사 데이터 수집에 실패했습니다.");
       }
 
       const incomingSignals = Array.isArray(data.signals) ? data.signals : [];
-      const incomingCandidates = Array.isArray(data.candidates) ? data.candidates : [];
+      const incomingBundles = Array.isArray(data.evidenceBundles) ? data.evidenceBundles : [];
       const signalIdMap = new Map<string, string>();
       const existingByKey = new Map(
         signals.map((signal) => [
@@ -588,31 +743,91 @@ export function ResearchWorkbench() {
         freshSignals.push(signal);
       });
 
-      const normalizedCandidates = incomingCandidates.map((candidate) => ({
-        ...candidate,
-        sourceSignalIds: candidate.sourceSignalIds.map((id) => signalIdMap.get(id) || id),
+      const normalizedBundles = incomingBundles.map((bundle) => ({
+        ...bundle,
+        sourceSignalIds: bundle.sourceSignalIds.map((id) => signalIdMap.get(id) || id),
       }));
 
       setSignals((current) => [...freshSignals, ...current]);
-
-      setCandidates((current) => {
-        const incomingTitles = new Set(normalizedCandidates.map((candidate) => candidate.title));
-        return [...normalizedCandidates, ...current.filter((candidate) => !incomingTitles.has(candidate.title))];
-      });
-
       setAutoResearchOffset(offset);
       setAutoResearchSeeds(Array.isArray(data.seeds) ? data.seeds : []);
       setAutoResearchWarnings(Array.isArray(data.errors) ? data.errors : []);
       setAutoResearchCooldown(data.cooldown || null);
-      const topIncoming = [...normalizedCandidates].sort((a, b) => scoreCandidate(b) - scoreCandidate(a))[0];
-      if (topIncoming) setActiveCandidateId(topIncoming.id);
-      setTab("candidates");
-      setToast(`자동 탐색 완료 · 주제 후보 ${normalizedCandidates.length}개를 만들었습니다.`);
-      window.setTimeout(() => window.scrollTo({ top: 0, left: 0, behavior: "auto" }), 0);
+      setAutoEvidenceBundles(normalizedBundles);
+      setAutoReviewPrompt(typeof data.reviewPrompt === "string" ? data.reviewPrompt : "");
+      if (normalizedBundles.length) {
+        const seenAt = new Date().toISOString();
+        setSeenTopics((current) => {
+          const byTitle = new Map(current.map((item) => [item.title.trim().toLowerCase(), item]));
+          normalizedBundles.forEach((bundle) => {
+            byTitle.set(bundle.query.trim().toLowerCase(), {
+              title: bundle.query,
+              problem: bundle.discoveredProblem,
+              seenAt,
+            });
+          });
+          return Array.from(byTitle.values()).slice(-160);
+        });
+      }
+
+      if (normalizedBundles.length && data.reviewPrompt) {
+        await writeClipboard(data.reviewPrompt);
+        setToast(`NAVER 증거 번들 ${normalizedBundles.length}개를 만들고 ChatGPT Pro 주제 심사 프롬프트를 복사했습니다.`);
+        window.setTimeout(() => {
+          document.getElementById("topic-review-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+        }, 0);
+      } else {
+        setToast("조사는 완료됐지만 ChatGPT Pro에 넘길 새 후보를 찾지 못했습니다. 다른 조사 범위로 다시 찾아보세요.");
+      }
     } catch (error) {
-      setAutoResearchError(error instanceof Error ? error.message : "자동 탐색에 실패했습니다.");
+      setAutoResearchError(error instanceof Error ? error.message : "조사 데이터 수집에 실패했습니다.");
     } finally {
       setAutoResearchLoading(false);
+    }
+  }
+
+  async function copyAutoReviewPrompt() {
+    if (!autoReviewPrompt) return;
+    await writeClipboard(autoReviewPrompt);
+    setToast("ChatGPT Pro 주제 심사 프롬프트를 다시 복사했습니다.");
+  }
+
+  async function copyEvidenceJson() {
+    if (!autoEvidenceBundles.length) return;
+    await writeClipboard(JSON.stringify({ evidenceBundles: autoEvidenceBundles }, null, 2));
+    setToast("오늘의 Evidence Bundle JSON을 복사했습니다.");
+  }
+
+  function importTopicReview() {
+    try {
+      const result = parseTopicReviewOutput(autoReviewOutput);
+      const bundleById = new Map(autoEvidenceBundles.map((bundle) => [bundle.id, bundle]));
+      const selectedReviews = result.reviews
+        .filter((review) => review.decision === "direct-test" || review.decision === "research-verification")
+        .slice(0, 3);
+
+      const imported = selectedReviews.flatMap((review) => {
+        const bundle = bundleById.get(review.bundleId);
+        if (!bundle) return [];
+        if (isExcludedContentTopic(`${review.title} ${review.problem}`)) return [];
+        return [candidateFromTopicReview(review, bundle)];
+      });
+
+      if (!imported.length) {
+        setToast("ChatGPT Pro가 제작 대상으로 선정한 후보가 없습니다. 오늘은 억지로 발행하지 않는 편이 좋습니다.");
+        return;
+      }
+
+      setCandidates((current) => {
+        const incomingTitles = new Set(imported.map((candidate) => candidate.title.trim().toLowerCase()));
+        return [...imported, ...current.filter((candidate) => !incomingTitles.has(candidate.title.trim().toLowerCase()))];
+      });
+      setActiveCandidateId(imported[0]?.id || null);
+      setTab("candidates");
+      setToast(`ChatGPT Pro가 선정한 후보 ${imported.length}개를 불러왔습니다. 직접 테스트형은 결과를 기록한 뒤 최종 글로 넘어갑니다.`);
+      window.setTimeout(() => window.scrollTo({ top: 0, left: 0, behavior: "auto" }), 0);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "ChatGPT Pro 심사 결과를 읽지 못했습니다.");
     }
   }
 
@@ -798,13 +1013,6 @@ export function ResearchWorkbench() {
     setToast("주제 후보를 만들었습니다. 점수와 고유 결과물을 보완하세요.");
   }
 
-  function createBlankCandidate() {
-    const candidate = defaultCandidate();
-    setCandidates((current) => [candidate, ...current]);
-    setActiveCandidateId(candidate.id);
-    setTab("candidates");
-  }
-
   function updateCandidate(id: string, patch: Partial<Candidate>) {
     setCandidates((current) =>
       current.map((candidate) =>
@@ -837,18 +1045,12 @@ export function ResearchWorkbench() {
   }
 
   async function copyCandidatePrompt(candidate: Candidate) {
-    const text = candidatePrompt(candidate, signals);
-    setActiveCandidateId(candidate.id);
-
-    setUsedTopics((current) => {
-      const next: UsedTopicHistory = {
-        title: candidate.title || candidate.problem || "제목 없는 후보",
-        problem: candidate.problem || undefined,
-        usedAt: new Date().toISOString(),
-      };
-      const filtered = current.filter((item) => item.title !== next.title);
-      return [...filtered, next].slice(-120);
-    });
+    if (!isUsableCandidate(candidate) || (!candidate.aiReview && scoreCandidate(candidate) < 60)) {
+      setToast("ChatGPT Pro가 선정했거나 수동 검토를 통과한 실제 질문 기반 후보만 프롬프트로 만들 수 있습니다.");
+      return;
+    }
+    const testRequired = needsDirectTest(candidate);
+    const text = promptForCandidate(candidate, signals);
 
     try {
       await navigator.clipboard.writeText(text);
@@ -864,8 +1066,29 @@ export function ResearchWorkbench() {
       textarea.remove();
     }
 
+    if (testRequired) {
+      setActiveCandidateId(candidate.id);
+      setPromptCopied(true);
+      setToast(`“${candidate.title}” ${candidate.experimentPlan?.durationDays || 3}일 테스트 계획을 복사했습니다. 실제 결과를 ‘직접 확보한 증거’에 입력하기 전까지 후보는 유지됩니다.`);
+      window.setTimeout(() => setPromptCopied(false), 1500);
+      return;
+    }
+
+    setUsedTopics((current) => {
+      const next: UsedTopicHistory = {
+        title: candidate.title || candidate.problem || "제목 없는 후보",
+        problem: candidate.problem || undefined,
+        usedAt: new Date().toISOString(),
+      };
+      const filtered = current.filter((item) => item.title !== next.title);
+      return [...filtered, next].slice(-120);
+    });
+
+    setCandidates((current) => current.filter((item) => item.id !== candidate.id));
+    const nextCandidate = visibleCandidates.find((item) => item.id !== candidate.id) || null;
+    setActiveCandidateId(nextCandidate?.id || null);
     setPromptCopied(true);
-    setToast(`“${candidate.title || "제목 없는 후보"}” ChatGPT 프롬프트를 복사했습니다.`);
+    setToast(`“${candidate.title || "제목 없는 후보"}” 프롬프트를 복사했고 후보 목록에서 숨겼습니다.`);
     window.setTimeout(() => setPromptCopied(false), 1500);
   }
 
@@ -874,7 +1097,7 @@ export function ResearchWorkbench() {
     await copyCandidatePrompt(activeCandidate);
   }
 
-  const activePrompt = activeCandidate ? candidatePrompt(activeCandidate, signals) : "";
+  const activePrompt = activeCandidate ? promptForCandidate(activeCandidate, signals) : "";
 
   return (
     <div className="min-h-screen bg-[#f7f7f5] text-zinc-900">
@@ -937,11 +1160,11 @@ export function ResearchWorkbench() {
           <div className="mt-6 hidden rounded-2xl border border-zinc-200 bg-white p-4 lg:block">
             <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">판단 원칙</div>
             <ul className="mt-3 space-y-2 text-xs leading-5 text-zinc-500">
-              <li>트렌드 = 언제 쓸지</li>
-              <li>뉴스 = 무엇이 바뀌었는지</li>
-              <li>커뮤니티 = 어디서 막히는지</li>
-              <li>공식자료 = 무엇이 사실인지</li>
-              <li>60점 미만 = 제작 보류</li>
+              <li>코드 = 수집·정리·중복 제거</li>
+              <li>지식iN = 실제 질문 발견</li>
+              <li>5개 API = 교차 증거 수집</li>
+              <li>ChatGPT Pro = 주제 최종 심사</li>
+              <li>사람 = 테스트·발행 시점 제어</li>
             </ul>
           </div>
           </div>
@@ -950,28 +1173,13 @@ export function ResearchWorkbench() {
         <main className="min-w-0">
           {tab === "discover" ? (
             <div className="space-y-6">
-              <section className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-                {[
-                  ["수집 신호", signals.length, "수요·불편·근거"],
-                  ["주제 후보", candidates.length, "평가 대기 포함"],
-                  ["우선 제작", dashboard.approved, "78점 이상"],
-                  ["공식 근거", dashboard.official, "검증 가능한 원문"],
-                ].map(([label, value, note]) => (
-                  <div key={String(label)} className="rounded-2xl border border-zinc-200 bg-white p-4">
-                    <div className="text-xs text-zinc-400">{label}</div>
-                    <div className="mt-2 text-3xl font-semibold tracking-[-0.05em] text-zinc-900">{value}</div>
-                    <div className="mt-1 text-[11px] text-zinc-400">{note}</div>
-                  </div>
-                ))}
-              </section>
-
               <section className="overflow-hidden rounded-3xl border border-zinc-900 bg-zinc-950 p-5 text-white sm:p-6">
                 <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_340px] xl:items-end">
                   <div>
                     <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">One-click Research</div>
-                    <h2 className="text-2xl font-semibold tracking-[-0.04em]">아무것도 입력하지 말고 오늘의 주제를 자동 탐색</h2>
+                    <h2 className="text-2xl font-semibold tracking-[-0.04em]">NAVER 데이터를 모으고 ChatGPT Pro에게 주제 심사를 맡기기</h2>
                     <p className="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
-                      미리 정해둔 완성 키워드를 돌려 쓰지 않습니다. 집 관리·디지털 생활·생활 행정·정리·계절 생활처럼 넓은 영역에서 지식iN·카페·블로그의 실제 질문을 먼저 수집한 뒤 문제를 클러스터링합니다. 최근 프롬프트로 사용한 주제는 60일, 최근 후보로 본 유사 주제는 14일 동안 제외하고, 같은 기기·같은 문제 유형이 한 번에 몰리지 않도록 5개를 고른 뒤 공식 근거와 검색어트렌드를 다시 확인합니다.
+                      앱은 지식iN에서 실제 질문을 찾고, 각 질문마다 검색어트렌드·카페·블로그·뉴스·웹문서 데이터를 Evidence Bundle JSON으로 묶는 데까지만 담당합니다. 스크립트 점수가 최종 주제를 결정하지 않습니다. 수집이 끝나면 모든 근거가 포함된 ChatGPT Pro 주제 심사 프롬프트를 자동으로 복사하고, 실제 선정·보류·직접 테스트 판단은 ChatGPT Pro 결과를 확인한 뒤 내가 직접 불러옵니다. 의료·법률·금융·재정·전문 안전 주제는 앞단과 심사 프롬프트에서 이중으로 제외합니다.
                     </p>
                     <div className="mt-4 flex flex-wrap gap-2 text-[11px] text-zinc-400">
                       <span className="rounded-full border border-zinc-800 px-2.5 py-1">지식iN · 실제 질문</span>
@@ -984,7 +1192,7 @@ export function ResearchWorkbench() {
                   </div>
                   <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-4">
                     <div className="text-xs font-medium text-zinc-300">오늘 할 일</div>
-                    <p className="mt-1 text-xs leading-5 text-zinc-500">키워드를 고민하지 않아도 됩니다. 실제 질문에서 새 문제를 발견하고, 최근 사용·노출 주제는 자동으로 제외합니다.</p>
+                    <p className="mt-1 text-xs leading-5 text-zinc-500">버튼을 누르면 NAVER 6개 API 데이터만 수집·정리합니다. 발행 후보 선정은 자동으로 확정하지 않고 ChatGPT Pro 심사 결과를 내가 다시 불러올 때만 진행합니다.</p>
                     <div className="mt-2 text-[11px] leading-5 text-zinc-500">
                       최근 프롬프트 사용 {usedTopics.filter((item) => Date.now() - new Date(item.usedAt).getTime() <= 60 * 86_400_000).length}개 · 60일 중복 방지
                     </div>
@@ -995,7 +1203,7 @@ export function ResearchWorkbench() {
                       className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-white px-4 py-3 text-sm font-semibold text-zinc-950 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       <SparkIcon className="h-4 w-4" />
-                      {autoResearchLoading ? "네이버 6개 API 조사 중..." : "오늘의 자동 탐색 시작"}
+                      {autoResearchLoading ? "NAVER 6개 API 증거 수집 중..." : "오늘의 자동 탐색 시작"}
                     </button>
                     {autoResearchSeeds.length ? (
                       <button
@@ -1004,7 +1212,7 @@ export function ResearchWorkbench() {
                         disabled={autoResearchLoading}
                         className="mt-2 w-full rounded-xl border border-zinc-700 px-4 py-2.5 text-xs font-medium text-zinc-300 transition hover:border-zinc-500 hover:text-white disabled:opacity-50"
                       >
-                        다른 주제 5개 찾기
+                        다른 조사 범위로 다시 찾기
                       </button>
                     ) : null}
                   </div>
@@ -1020,7 +1228,7 @@ export function ResearchWorkbench() {
                   <div className="mt-5 border-t border-zinc-800 pt-5">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
-                        <div className="text-xs font-medium text-zinc-300">이번 자동 탐색 범위</div>
+                        <div className="text-xs font-medium text-zinc-300">이번 조사 범위</div>
                         <div className="mt-2 flex flex-wrap gap-2">
                           {autoResearchSeeds.map((seed) => (
                             <span key={seed.query} className="rounded-full bg-zinc-800 px-2.5 py-1 text-[11px] text-zinc-300">
@@ -1047,6 +1255,105 @@ export function ResearchWorkbench() {
                   </div>
                 ) : null}
               </section>
+
+              {autoReviewPrompt || autoEvidenceBundles.length ? (
+                <section id="topic-review-panel" className="scroll-mt-24 rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+                  <SectionTitle
+                    eyebrow="ChatGPT Pro Topic Review"
+                    title="수집한 JSON은 그대로 두고, 주제 판단은 ChatGPT Pro에서"
+                    description="앱은 Evidence Bundle을 만들었을 뿐 최종 주제를 선정하지 않았습니다. 복사된 프롬프트를 ChatGPT Pro 새 대화에 붙여넣고, 반환된 JSON 전체를 아래 입력란에 붙여넣은 뒤 직접 후보를 불러오세요. 선정 후보는 최대 3개이며, 데이터가 약하면 0개여도 정상입니다."
+                  />
+
+                  <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_260px]">
+                    <div className="rounded-2xl bg-zinc-50 p-4">
+                      <div className="text-xs font-semibold text-zinc-700">오늘의 Evidence Bundle</div>
+                      <p className="mt-1 text-xs leading-5 text-zinc-500">
+                        지식iN에서 발견한 문제 {autoEvidenceBundles.length}개를 기준으로 검색어트렌드·카페·블로그·뉴스·웹문서 데이터를 묶었습니다. 각 원문 URL과 스니펫도 ChatGPT Pro 심사 프롬프트에 포함됩니다.
+                      </p>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button type="button" onClick={() => void copyAutoReviewPrompt()} className="inline-flex items-center gap-2 rounded-xl bg-zinc-900 px-3 py-2 text-xs font-medium text-white hover:bg-zinc-800">
+                          <CopyIcon className="h-3.5 w-3.5" /> 주제 심사 프롬프트 다시 복사
+                        </button>
+                        <button type="button" onClick={() => void copyEvidenceJson()} className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs font-medium text-zinc-600 hover:border-zinc-300 hover:text-zinc-900">
+                          <FileTextIcon className="h-3.5 w-3.5" /> Evidence JSON 복사
+                        </button>
+                      </div>
+                    </div>
+                    <div className="rounded-2xl border border-zinc-200 p-4">
+                      <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">수동 제어 흐름</div>
+                      <ol className="mt-2 space-y-1.5 text-xs leading-5 text-zinc-600">
+                        <li>1. NAVER 데이터 수집</li>
+                        <li>2. ChatGPT Pro에서 주제 심사</li>
+                        <li>3. 심사 JSON을 아래에 붙여넣기</li>
+                        <li>4. 내가 후보 불러오기 버튼 클릭</li>
+                        <li>5. 직접 테스트 또는 조사 후 최종 글 작성</li>
+                      </ol>
+                    </div>
+                  </div>
+
+                  <div className="mt-5 grid gap-3 lg:grid-cols-2">
+                    {autoEvidenceBundles.map((bundle) => (
+                      <article key={bundle.id} className="rounded-2xl border border-zinc-200 p-4">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="text-[11px] font-medium text-zinc-400">{bundle.discoveryCategory}</div>
+                            <h3 className="mt-1 font-semibold leading-6 text-zinc-800">{bundle.query}</h3>
+                          </div>
+                          <div className="rounded-lg bg-zinc-100 px-2 py-1 text-[11px] font-medium text-zinc-500">지식iN {bundle.questions.length}건</div>
+                        </div>
+                        <div className="mt-3 flex flex-wrap gap-1.5 text-[10px] text-zinc-500">
+                          <span className={classNames("rounded-full px-2 py-1", bundle.coverage.trend ? "bg-emerald-50 text-emerald-700" : "bg-zinc-100")}>트렌드 {bundle.coverage.trend ? "있음" : "없음"}</span>
+                          <span className={classNames("rounded-full px-2 py-1", bundle.coverage.cafe ? "bg-emerald-50 text-emerald-700" : "bg-zinc-100")}>카페 {bundle.cafe.length}</span>
+                          <span className={classNames("rounded-full px-2 py-1", bundle.coverage.blog ? "bg-emerald-50 text-emerald-700" : "bg-zinc-100")}>블로그 {bundle.blog.length}</span>
+                          <span className={classNames("rounded-full px-2 py-1", bundle.coverage.news ? "bg-emerald-50 text-emerald-700" : "bg-zinc-100")}>뉴스 {bundle.news.length}</span>
+                          <span className={classNames("rounded-full px-2 py-1", bundle.coverage.web ? "bg-emerald-50 text-emerald-700" : "bg-zinc-100")}>웹문서 {bundle.web.length}</span>
+                        </div>
+                        <div className="mt-3 space-y-2">
+                          {bundle.questions.slice(0, 3).map((question, index) => (
+                            <div key={`${bundle.id}-q-${index}`} className="rounded-xl bg-zinc-50 p-3">
+                              <div className="flex items-start justify-between gap-3">
+                                <p className="text-xs leading-5 text-zinc-700">{question.title}</p>
+                                {question.url ? (
+                                  <a href={question.url} target="_blank" rel="noreferrer" className="shrink-0 text-[10px] font-medium text-zinc-400 hover:text-zinc-900">
+                                    원문 <ExternalIcon className="ml-0.5 inline h-3 w-3" />
+                                  </a>
+                                ) : null}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+
+                  <details className="mt-5 rounded-2xl border border-zinc-200 p-4">
+                    <summary className="cursor-pointer text-xs font-semibold text-zinc-600">Evidence Bundle JSON 미리보기</summary>
+                    <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-xl bg-zinc-950 p-4 text-[10px] leading-5 text-zinc-300">{JSON.stringify(autoEvidenceBundles, null, 2)}</pre>
+                  </details>
+
+                  <div className="mt-5 border-t border-zinc-100 pt-5">
+                    <label className="block">
+                      <span className="text-xs font-semibold text-zinc-700">ChatGPT Pro 주제 심사 결과 붙여넣기</span>
+                      <span className="mt-1 block text-[11px] leading-5 text-zinc-400">ChatGPT가 반환한 JSON 전체 또는 ```json 코드블록을 그대로 붙여넣으면 됩니다. hold/exclude는 후보 목록에 들어오지 않습니다.</span>
+                      <textarea
+                        value={autoReviewOutput}
+                        onChange={(event) => setAutoReviewOutput(event.target.value)}
+                        rows={10}
+                        placeholder='{"reviewSummary":"...","reviews":[...]}'
+                        className="mt-2 w-full resize-y rounded-2xl border border-zinc-200 bg-zinc-50 p-4 font-mono text-xs leading-5 outline-none placeholder:text-zinc-300 focus:border-zinc-400"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={importTopicReview}
+                      disabled={!autoReviewOutput.trim()}
+                      className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-zinc-900 px-4 py-3 text-sm font-semibold text-white hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40 sm:w-auto"
+                    >
+                      <CheckIcon className="h-4 w-4" /> ChatGPT Pro 선정 후보 불러오기
+                    </button>
+                  </div>
+                </section>
+              ) : null}
 
               <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
                 <SectionTitle
@@ -1215,14 +1522,13 @@ export function ResearchWorkbench() {
                   <div>
                     <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-400">Topic Queue</div>
                     <h2 className="mt-1 text-xl font-semibold tracking-[-0.02em]">주제 후보</h2>
-                    <p className="mt-1 text-[11px] text-zinc-400">후보를 누르면 선택과 동시에 ChatGPT 프롬프트가 복사됩니다.</p>
+                    <p className="mt-1 text-[11px] text-zinc-400">자동 조사 후보는 ChatGPT Pro에서 direct-test 또는 research-verification으로 선정된 것만 표시합니다. 직접 테스트형은 실제 결과가 입력될 때까지 후보를 유지합니다.</p>
                   </div>
-                  <button type="button" onClick={createBlankCandidate} className="flex h-9 w-9 items-center justify-center rounded-xl bg-zinc-900 text-white hover:bg-zinc-800" aria-label="새 후보"><PlusIcon className="h-4 w-4" /></button>
                 </div>
                 <div className="space-y-3">
-                  {sortedCandidates.length ? sortedCandidates.map((candidate) => (
+                  {visibleCandidates.length ? visibleCandidates.map((candidate) => (
                     <CandidateCard key={candidate.id} candidate={candidate} active={activeCandidateId === candidate.id} onOpen={() => void copyCandidatePrompt(candidate)} onDelete={() => deleteCandidate(candidate.id)} />
-                  )) : <EmptyState title="후보가 없습니다" description="탐색 탭에서 여러 신호를 선택해 하나의 문제 클러스터로 묶거나 새 후보를 직접 만드세요." />}
+                  )) : <EmptyState title="표시할 제작 후보가 없습니다" description="탐색 탭에서 NAVER 데이터를 수집한 뒤 ChatGPT Pro 심사 JSON을 붙여넣고 선정 후보를 불러오세요. hold/exclude 후보는 표시하지 않습니다." />}
                 </div>
               </section>
 
@@ -1237,7 +1543,7 @@ export function ResearchWorkbench() {
                     onCopyPrompt={() => void copyCandidatePrompt(activeCandidate)}
                   />
                 ) : (
-                  <div className="sticky top-20"><EmptyState title="검토할 후보를 선택하세요" description="왼쪽 목록에서 후보를 선택하면 게시 가치 점수, 감점 요인, 고유 결과물과 검증 계획을 편집할 수 있습니다." /></div>
+                  <div className="sticky top-20"><EmptyState title="검토할 후보를 선택하세요" description="왼쪽 목록에서 후보를 선택하면 ChatGPT Pro 심사 근거, 연결된 실제 질문, 고유 결과물과 테스트·검증 계획을 확인할 수 있습니다." /></div>
                 )}
               </section>
             </div>
@@ -1246,16 +1552,16 @@ export function ResearchWorkbench() {
           {tab === "prompt" ? (
             <div className="grid gap-5 xl:grid-cols-[320px_minmax(0,1fr)]">
               <section>
-                <SectionTitle eyebrow="Final Gate" title="ChatGPT용 자동 작성 후보" description="점수가 높은 순서로 정렬됩니다. 후보 하나만 고르면 ChatGPT가 콘텐츠 방식·구조·근거·고유 결과물을 다시 판단하고, 약한 주제는 스스로 보류하도록 설계했습니다." />
+                <SectionTitle eyebrow="Final Gate" title="ChatGPT Pro 심사 후 최종 작성 후보" description="NAVER 6개 API Evidence Bundle을 ChatGPT Pro가 비교해 선정한 후보만 사용합니다. 직접 테스트형은 실제 증거가 입력된 뒤에만 최종 글 프롬프트로 전환합니다." />
                 <div className="space-y-2">
-                  {sortedCandidates.length ? sortedCandidates.map((candidate) => (
+                  {visibleCandidates.length ? visibleCandidates.map((candidate) => (
                     <button key={candidate.id} type="button" onClick={() => void copyCandidatePrompt(candidate)} className={classNames("w-full rounded-2xl border p-4 text-left transition", activeCandidateId === candidate.id ? "border-zinc-900 bg-white" : "border-zinc-200 bg-white hover:border-zinc-300")}> 
                       <div className="flex items-center justify-between gap-3">
                         <span className="line-clamp-2 text-sm font-medium text-zinc-800">{candidate.title || "제목 없는 후보"}</span>
-                        <span className="text-lg font-semibold">{scoreCandidate(candidate)}</span>
+                        <span className="text-xs font-semibold text-zinc-500">{candidate.aiReview ? `유입 ${reviewLevelLabel(candidate.aiReview.trafficPotential)}` : `${scoreCandidate(candidate)}점`}</span>
                       </div>
                     </button>
-                  )) : <EmptyState title="후보가 없습니다" description="먼저 탐색 탭에서 주제 후보를 만들어주세요." />}
+                  )) : <EmptyState title="표시할 제작 후보가 없습니다" description="ChatGPT Pro 심사에서 선정된 후보를 먼저 불러오세요. 이미 최종 프롬프트를 복사한 후보는 목록에서 숨깁니다." />}
                 </div>
               </section>
 
@@ -1265,17 +1571,17 @@ export function ResearchWorkbench() {
                     <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
                       <div>
                         <div className="mb-2 flex items-center gap-2">
-                          <Badge tone={verdict(scoreCandidate(activeCandidate)).tone}>{verdict(scoreCandidate(activeCandidate)).label}</Badge>
-                          <Badge>{scoreCandidate(activeCandidate)}점</Badge>
+                          {activeCandidate.aiReview ? <Badge tone="good">ChatGPT Pro 선정</Badge> : <Badge tone={verdict(scoreCandidate(activeCandidate)).tone}>{verdict(scoreCandidate(activeCandidate)).label}</Badge>}
+                          <Badge>{activeCandidate.aiReview ? `유입 ${reviewLevelLabel(activeCandidate.aiReview.trafficPotential)}` : `${scoreCandidate(activeCandidate)}점`}</Badge>
                         </div>
-                        <h2 className="text-xl font-semibold tracking-[-0.02em]">ChatGPT 자동 판단·작성 프롬프트</h2>
-                        <p className="mt-1 text-sm leading-6 text-zinc-500">추가 선택 없이 후보와 조사 신호를 바탕으로 게시 여부부터 글 구조까지 모델이 직접 결정합니다. AdSense 승인을 보장할 수는 없지만 저가치·대량생산형 콘텐츠 위험을 줄이는 기준을 강하게 적용합니다.</p>
+                        <h2 className="text-xl font-semibold tracking-[-0.02em]">{needsDirectTest(activeCandidate) ? `${activeCandidate.experimentPlan?.durationDays || 3}일 테스트 계획 프롬프트` : "ChatGPT 최종 작성 프롬프트"}</h2>
+                        <p className="mt-1 text-sm leading-6 text-zinc-500">{needsDirectTest(activeCandidate) ? "실제 결과를 만들기 전에는 원고를 쓰지 않습니다. 안전한 테스트 범위와 기록 항목만 설계하고 후보를 유지합니다." : "직접 테스트 증거 또는 조사·검증 근거가 준비된 후보만 최종 원고로 넘깁니다. 저가치·대량생산형 패턴을 피하도록 최종 게이트를 적용합니다."}</p>
                       </div>
-                      <button type="button" onClick={() => void copyPrompt()} className="inline-flex items-center gap-2 rounded-xl bg-zinc-900 px-4 py-2.5 text-xs font-medium text-white hover:bg-zinc-800">{promptCopied ? <CheckIcon className="h-4 w-4" /> : <CopyIcon className="h-4 w-4" />} {promptCopied ? "복사됨" : "ChatGPT용 프롬프트 복사"}</button>
+                      <button type="button" onClick={() => void copyPrompt()} className="inline-flex items-center gap-2 rounded-xl bg-zinc-900 px-4 py-2.5 text-xs font-medium text-white hover:bg-zinc-800">{promptCopied ? <CheckIcon className="h-4 w-4" /> : <CopyIcon className="h-4 w-4" />} {promptCopied ? "복사됨" : needsDirectTest(activeCandidate) ? "테스트 계획 복사" : "최종 글 프롬프트 복사"}</button>
                     </div>
-                    {scoreCandidate(activeCandidate) < 60 ? (
+                    {!activeCandidate.aiReview && scoreCandidate(activeCandidate) < 60 ? (
                       <div className="mb-4 rounded-2xl border border-rose-200 bg-rose-50 p-4 text-sm leading-6 text-rose-700">
-                        현재 후보는 60점 미만입니다. ChatGPT가 웹 조사로 보완 가능성을 다시 확인하되, 공식 근거와 고유 결과물을 확보하지 못하면 글을 작성하지 않고 보류하도록 되어 있습니다.
+                        수동 후보의 보조 점수가 낮습니다. 공식 근거와 고유 결과물을 확보하지 못하면 글을 작성하지 않고 보류하세요.
                       </div>
                     ) : null}
                     <pre className="max-h-[720px] overflow-auto whitespace-pre-wrap rounded-2xl bg-zinc-950 p-5 text-xs leading-6 text-zinc-200 scrollbar-thin">{activePrompt}</pre>
@@ -1308,6 +1614,7 @@ function CandidateEditor({
   const score = scoreCandidate(candidate);
   const result = verdict(score);
   const linkedSignals = signals.filter((signal) => candidate.sourceSignalIds.includes(signal.id));
+  const questionSignals = linkedSignals.filter((signal) => signal.kind === "naver-kin");
   const activePenalties = PENALTY_FIELDS.filter((field) => candidate.penalties[field.key]);
 
   return (
@@ -1316,14 +1623,33 @@ function CandidateEditor({
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
             <div className="mb-2 flex flex-wrap gap-2">
-              <Badge tone={result.tone}>{result.label}</Badge>
-              <Badge>{CONTENT_MODE_LABELS[candidate.contentMode]} · 자동 추정</Badge>
+              {candidate.aiReview ? <Badge tone="good">ChatGPT Pro 심사 선정</Badge> : <Badge tone={result.tone}>{result.label}</Badge>}
+              <Badge>{candidate.experimentPlan?.recommended ? `직접 테스트 추천 · ${candidate.experimentPlan.durationDays}일` : `${CONTENT_MODE_LABELS[candidate.contentMode]}${candidate.aiReview ? " · ChatGPT Pro 판단" : ""}`}</Badge>
             </div>
             <h2 className="text-2xl font-semibold tracking-[-0.04em] text-zinc-900">{candidate.title || "제목 없는 후보"}</h2>
             <p className="mt-2 max-w-3xl text-sm leading-6 text-zinc-500">{candidate.problem || "자동 탐색 신호를 바탕으로 해결하려는 문제를 다시 판단합니다."}</p>
           </div>
-          <ScoreRing score={score} />
+          {candidate.aiReview ? (
+            <div className="rounded-2xl bg-zinc-50 px-4 py-3 text-right">
+              <div className="text-sm font-semibold text-zinc-800">유입 {reviewLevelLabel(candidate.aiReview.trafficPotential)}</div>
+              <div className="mt-1 text-[10px] text-zinc-400">ChatGPT Pro 주제 심사</div>
+            </div>
+          ) : <ScoreRing score={score} />}
         </div>
+
+        {candidate.aiReview ? (
+          <div className="mt-5 rounded-2xl border border-emerald-100 bg-emerald-50/60 p-4">
+            <div className="flex flex-wrap gap-2">
+              <Badge tone="good">반복 수요 {reviewLevelLabel(candidate.aiReview.repeatedDemand)}</Badge>
+              <Badge tone="blue">근거 {reviewLevelLabel(candidate.aiReview.evidenceQuality)}</Badge>
+              <Badge tone="warn">포화도 {reviewLevelLabel(candidate.aiReview.contentSaturation)}</Badge>
+              <Badge tone="good">고유성 {reviewLevelLabel(candidate.aiReview.originalityPotential)}</Badge>
+              <Badge>{candidate.aiReview.category}</Badge>
+            </div>
+            <p className="mt-3 text-xs leading-5 text-zinc-600">{candidate.aiReview.rationale}</p>
+            <p className="mt-2 text-[11px] leading-5 text-zinc-500"><span className="font-semibold text-zinc-600">검색 의도:</span> {candidate.aiReview.searchIntent}</p>
+          </div>
+        ) : null}
 
         <div className="mt-5 grid gap-3 md:grid-cols-3">
           <div className="rounded-2xl bg-zinc-50 p-4">
@@ -1345,15 +1671,15 @@ function CandidateEditor({
           onClick={onCopyPrompt}
           className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-zinc-900 px-4 py-3 text-sm font-semibold text-white hover:bg-zinc-800 sm:w-auto"
         >
-          <CopyIcon className="h-4 w-4" /> ChatGPT 프롬프트 다시 복사
+          <CopyIcon className="h-4 w-4" /> {needsDirectTest(candidate) ? `${candidate.experimentPlan?.durationDays || 3}일 테스트 계획 복사` : "최종 글 프롬프트 다시 복사"}
         </button>
       </section>
 
       <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
         <SectionTitle
-          eyebrow="Auto Quality Gate"
-          title="게시 가치 평가는 앱이 먼저 판단"
-          description="슬라이더를 직접 맞출 필요가 없습니다. 자동 탐색에서 수요·문제성·공식 근거·고유성·지속성을 계산하고, ChatGPT 프롬프트가 웹 조사 후 한 번 더 최종 판단합니다."
+          eyebrow="Review Rubric"
+          title={candidate.aiReview ? "ChatGPT Pro 심사의 보조 평가값" : "수동 후보의 보조 평가값"}
+          description={candidate.aiReview ? "아래 0~5 값은 ChatGPT Pro가 JSON으로 함께 반환한 UI 호환용 보조값입니다. 후보 선정은 숫자 공식이 아니라 위의 심사 근거와 decision을 기준으로 이뤄졌습니다." : "수동으로 만든 후보에만 기존 점수표를 참고합니다. 자동 NAVER 조사 결과는 이제 스크립트 점수로 후보를 확정하지 않습니다."}
         />
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           {SCORE_FIELDS.map((field) => (
@@ -1368,16 +1694,40 @@ function CandidateEditor({
         </div>
 
         <div className="mt-5 border-t border-zinc-100 pt-5">
-          <div className="text-xs font-semibold text-zinc-700">자동 감점 진단</div>
+          <div className="text-xs font-semibold text-zinc-700">보조 감점 진단</div>
           <div className="mt-3 flex flex-wrap gap-2">
             {activePenalties.length ? activePenalties.map((field) => <Badge key={field.key} tone="bad">{field.label}</Badge>) : <Badge tone="good">감점 요인 없음</Badge>}
           </div>
-          <p className="mt-2 text-[11px] leading-5 text-zinc-400">이 점수는 사전 필터입니다. 최종 프롬프트에서는 최신 공식 자료를 다시 확인하고 필요하면 사전 판단을 뒤집도록 지시합니다.</p>
+          <p className="mt-2 text-[11px] leading-5 text-zinc-400">이 값은 정렬·표시를 위한 참고 정보입니다. 실제 발행 여부는 공식 근거 확인, 직접 테스트 결과, 고유 결과물의 존재를 다시 확인한 뒤 결정합니다.</p>
         </div>
       </section>
 
+      {candidate.experimentPlan?.recommended ? (
+        <section className="rounded-3xl border border-amber-200 bg-amber-50/60 p-5 sm:p-6">
+          <SectionTitle
+            eyebrow="Direct Test Gate"
+            title={`직접 테스트 추천 · ${candidate.experimentPlan.durationDays}일`}
+            description="매일 별도 글을 발행하지 않고 내부 기록을 모은 뒤, 실제 증거가 준비됐을 때 하나의 결과 글로 통합합니다."
+          />
+          <div className="grid gap-3 lg:grid-cols-2">
+            <div className="rounded-2xl border border-amber-200 bg-white p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-amber-700">테스트 방향</div>
+              <p className="mt-2 text-sm leading-6 text-zinc-700">{candidate.experimentPlan.plan}</p>
+            </div>
+            <div className="rounded-2xl border border-amber-200 bg-white p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-amber-700">기록할 지표</div>
+              <ul className="mt-2 space-y-1 text-sm leading-6 text-zinc-700">
+                {candidate.experimentPlan.metrics.map((metric) => <li key={metric}>• {metric}</li>)}
+              </ul>
+            </div>
+          </div>
+          <p className="mt-3 text-xs leading-5 text-amber-800">{candidate.experimentPlan.completionRule}</p>
+          {!hasDirectTestEvidence(candidate) ? <p className="mt-2 text-xs font-medium text-amber-900">아직 실제 결과가 입력되지 않았습니다. 아래 고급 설정의 ‘직접 확보한 증거’에 테스트 결과를 붙여 넣으면 최종 글 프롬프트로 전환됩니다.</p> : <p className="mt-2 text-xs font-medium text-emerald-700">직접 증거가 입력되어 최종 글 작성 단계로 전환할 수 있습니다.</p>}
+        </section>
+      ) : null}
+
       <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
-        <SectionTitle eyebrow="Original Value" title="고유 결과물과 검증 방식도 자동 설계" description="일반적인 SEO 글이 아니라 비교표·판단 흐름·체크리스트·공식자료 대조처럼 실제 추가 가치를 만드는 방향으로 설계합니다." />
+        <SectionTitle eyebrow="Original Value" title={candidate.aiReview ? "ChatGPT Pro가 선정 단계에서 설계한 고유 결과물" : "고유 결과물과 검증 방식"} description="일반적인 SEO 글이 아니라 비교표·판단 흐름·체크리스트·공식자료 대조처럼 실제 추가 가치를 만드는 방향인지 최종 글 작성 전 다시 확인합니다." />
         <div className="grid gap-3 lg:grid-cols-2">
           <div className="rounded-2xl bg-zinc-50 p-4">
             <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">고유 결과물</div>
@@ -1397,6 +1747,40 @@ function CandidateEditor({
       </section>
 
       <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+        <SectionTitle
+          eyebrow="Question Sources"
+          title={`실제 문제 발견 출처 ${questionSignals.length}개`}
+          description="최종 후보는 지식iN 질문에서 먼저 발견합니다. 카페·블로그는 이후 교차 검증 신호이며, 원문 URL이 있는 항목은 클릭해 직접 확인할 수 있습니다."
+        />
+        {questionSignals.length ? (
+          <div className="grid gap-2 md:grid-cols-2">
+            {questionSignals.map((signal) => (
+              <article key={signal.id} className="rounded-xl border border-zinc-200 p-3">
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <Badge tone={signal.kind === "naver-kin" ? "blue" : "neutral"}>{SIGNAL_LABELS[signal.kind]}</Badge>
+                  {signal.url ? (
+                    <a
+                      href={signal.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-zinc-500 hover:text-zinc-900"
+                    >
+                      {signal.kind === "naver-kin" ? "질문 원문 열기" : signal.kind === "naver-cafe" ? "게시글 원문 열기" : "원문 열기"}
+                      <ExternalIcon className="h-3 w-3" />
+                    </a>
+                  ) : null}
+                </div>
+                <p className="text-xs font-medium leading-5 text-zinc-700">{signal.title}</p>
+                {signal.snippet ? <p className="mt-1 line-clamp-3 text-[11px] leading-5 text-zinc-500">{signal.snippet}</p> : null}
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm text-zinc-400">연결된 실제 질문 출처가 없습니다. 자동 탐색을 다시 실행해 실제 질문 기반 후보를 우선 사용하는 것을 권장합니다.</p>
+        )}
+      </section>
+
+      <section className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <SectionTitle eyebrow="Evidence Set" title={`연결된 조사 신호 ${linkedSignals.length}개`} description="사용자가 별도로 고를 필요는 없습니다. 자동 탐색이 연결한 신호를 ChatGPT가 참고하고, 부족한 근거는 웹 검색으로 추가 확인하도록 프롬프트에 포함합니다." />
         </div>
@@ -1404,7 +1788,14 @@ function CandidateEditor({
           <div className="grid gap-2 md:grid-cols-2">
             {linkedSignals.map((signal) => (
               <div key={signal.id} className="rounded-xl border border-zinc-200 p-3">
-                <div className="mb-1 flex gap-2"><Badge>{SIGNAL_LABELS[signal.kind]}</Badge></div>
+                <div className="mb-1 flex flex-wrap items-center gap-2">
+                  <Badge>{SIGNAL_LABELS[signal.kind]}</Badge>
+                  {signal.url ? (
+                    <a href={signal.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[11px] text-zinc-500 hover:text-zinc-900">
+                      원문 <ExternalIcon className="h-3 w-3" />
+                    </a>
+                  ) : null}
+                </div>
                 <div className="text-xs font-medium leading-5 text-zinc-700">{signal.title}</div>
               </div>
             ))}
@@ -1413,7 +1804,7 @@ function CandidateEditor({
       </section>
 
       <details className="rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
-        <summary className="cursor-pointer list-none text-sm font-semibold text-zinc-700">고급 설정 · 자동 판단을 직접 수정할 때만 열기</summary>
+        <summary className="cursor-pointer list-none text-sm font-semibold text-zinc-700">고급 설정 · 심사 결과를 직접 수정할 때만 열기</summary>
         <p className="mt-2 text-xs leading-5 text-zinc-400">일반 사용에서는 건드리지 않아도 됩니다. 자동 평가가 명백히 잘못된 경우에만 보정하세요.</p>
 
         <div className="mt-5 grid gap-3 md:grid-cols-2">
