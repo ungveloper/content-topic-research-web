@@ -1,0 +1,39 @@
+name: KIN Life Guide Monitor
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+      timezone: 'Asia/Seoul'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kin-life-guide-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check new Naver Knowledge iN questions
+        env:
+          NAVER_API_HUB_CLIENT_ID: ${{ secrets.NAVER_API_HUB_CLIENT_ID }}
+          NAVER_API_HUB_CLIENT_SECRET: ${{ secrets.NAVER_API_HUB_CLIENT_SECRET }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATA_SOURCE_ID: ${{ secrets.NOTION_DATA_SOURCE_ID }}
+          NOTION_URL_PROPERTY: ${{ vars.NOTION_URL_PROPERTY }}
+          MONITOR_SCORE_THRESHOLD: ${{ vars.MONITOR_SCORE_THRESHOLD }}
+          MONITOR_MAX_PAGES_PER_RUN: ${{ vars.MONITOR_MAX_PAGES_PER_RUN }}
+          MONITOR_SEEDS_PER_RUN: ${{ vars.MONITOR_SEEDS_PER_RUN }}
+        run: node scripts/kin-life-guide-monitor.mjs
