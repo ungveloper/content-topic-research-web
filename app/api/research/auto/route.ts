@@ -1186,6 +1186,7 @@ export async function POST(request: NextRequest) {
     seeds: seedSummary,
     cooldown,
     editorialContext,
+    focusedSourceQuestion: sourceQuestion,
   });
 
   return NextResponse.json({

@@ -876,7 +876,7 @@ export function ResearchWorkbench() {
     if (!autoReviewPrompt) return;
     await writeClipboard(autoReviewPrompt);
     setAutoReviewPromptCopied(true);
-    setToast("심사 프롬프트를 복사했습니다. ChatGPT Pro에 붙여넣으세요.");
+    setToast(autoSourceQuestion ? "최종 작성 프롬프트를 복사했습니다. ChatGPT Pro에 붙여넣으세요." : "심사 프롬프트를 복사했습니다. ChatGPT Pro에 붙여넣으세요.");
   }
 
   function reviewPromptForBundles(bundles: ResearchEvidenceBundle[]) {
@@ -897,6 +897,7 @@ export function ResearchWorkbench() {
         seenCount: 0,
       },
       editorialContext,
+      focusedSourceQuestion: autoSourceQuestion || undefined,
     });
   }
 
@@ -1271,8 +1272,8 @@ export function ResearchWorkbench() {
                   <div className="rounded-2xl border border-zinc-800 bg-zinc-900/70 p-4">
                     {!autoResearchLoading && autoReviewPrompt ? (
                       <>
-                        <div className="text-xs font-medium text-zinc-300">프롬프트 복사하기</div>
-                        <p className="mt-1 text-xs leading-5 text-zinc-500">NAVER 6개 API 증거 수집이 끝났습니다. 아래 프롬프트를 복사해 ChatGPT Pro에 붙여넣고 추천 순위를 확인한 뒤 번호만 선택하면 됩니다.</p>
+                        <div className="text-xs font-medium text-zinc-300">{autoSourceQuestion ? "최종 작성 프롬프트 복사" : "프롬프트 복사하기"}</div>
+                        <p className="mt-1 text-xs leading-5 text-zinc-500">{autoSourceQuestion ? "선택한 지식iN 원문에 대한 증거 수집이 끝났습니다. 프롬프트를 ChatGPT Pro에 붙여넣으면 별도의 후보 선택 없이 내부 품질 검증과 공식 원문 재검증을 거쳐 통과 시 바로 WordPress 최종 아웃풋을 작성합니다." : "NAVER 6개 API 증거 수집이 끝났습니다. 아래 프롬프트를 복사해 ChatGPT Pro에 붙여넣고 추천 순위를 확인한 뒤 번호만 선택하면 됩니다."}</p>
                         <div className="mt-2 text-[11px] leading-5 text-zinc-500">
                           최근 프롬프트 사용 {usedTopics.filter((item) => Date.now() - new Date(item.usedAt).getTime() <= 60 * 86_400_000).length}개 · 60일 중복 방지
                         </div>
@@ -1291,7 +1292,7 @@ export function ResearchWorkbench() {
                             <span className="min-w-0 truncate">{autoReviewPromptCopied ? "복사 완료" : "프롬프트 복사"}</span>
                           </button>
                           <div aria-live="polite" className="min-h-5 pt-1.5 text-center text-[10px] leading-4 text-zinc-500">
-                            {autoReviewPromptCopied ? "클립보드에 복사되었습니다. ChatGPT Pro에 붙여넣으세요." : "추천 번호를 선택하면 조사·검증형은 공식 원문 검증 후 WordPress 원고 작성까지 이어집니다."}
+                            {autoReviewPromptCopied ? "클립보드에 복사되었습니다. ChatGPT Pro에 붙여넣으세요." : autoSourceQuestion ? "선택 단계 없이 검증을 통과하면 # 1~# 4 최종 아웃풋이 바로 생성됩니다." : "추천 번호를 선택하면 조사·검증형은 공식 원문 검증 후 WordPress 원고 작성까지 이어집니다."}
                           </div>
                         </div>
                       </>
@@ -1370,7 +1371,7 @@ export function ResearchWorkbench() {
                 <SectionTitle
                   eyebrow="Focused Research"
                   title="지식iN 원문으로 바로 조사"
-                  description="Notion에서 괜찮은 질문을 골랐거나 직접 발견한 지식iN 질문이 있다면 원문 URL 하나만 붙여넣으세요. 해당 질문을 고정 출발점으로 삼아 유사 독립 질문·검색어트렌드·카페·블로그·뉴스·웹문서를 다시 수집하고 기존 WordPress 글·Search Console 신호까지 같은 심사 로직에 연결합니다."
+                  description="Notion에서 괜찮은 질문을 골랐거나 직접 발견한 지식iN 질문이 있다면 원문 URL 하나만 붙여넣으세요. 해당 질문을 고정 출발점으로 유사 독립 질문·검색어트렌드·카페·블로그·뉴스·웹문서를 다시 수집하고, ChatGPT Pro에서는 별도 후보 선택 없이 품질 검증과 공식 원문 재검증을 거쳐 통과 시 바로 WordPress 최종 아웃풋까지 작성합니다."
                 />
                 <form
                   className="grid min-w-0 gap-3 lg:grid-cols-[minmax(0,1fr)_180px]"
@@ -1411,7 +1412,7 @@ export function ResearchWorkbench() {
                   </button>
                 </form>
                 <p className="mt-2 break-words text-[11px] leading-5 text-zinc-400 [overflow-wrap:anywhere]">
-                  URL을 넣었다고 바로 글을 만들지는 않습니다. 원문 질문을 먼저 확인하고, 같은 문제를 묻는 다른 질문과 최근 수요·에버그린성·공식 근거·기존 글 중복 가능성을 다시 조사한 뒤 ChatGPT Pro가 발행/보류/기존 글 업데이트 여부를 판단합니다.
+                  URL을 넣으면 후보 선택 단계는 생략합니다. 다만 품질 검증은 생략하지 않으며, 같은 문제의 반복 수요·에버그린성·공식 근거·기존 글 중복을 다시 확인한 뒤 통과한 경우에만 ChatGPT Pro가 바로 WordPress 최종 아웃풋을 작성합니다.
                 </p>
                 {kinUrlResearchError ? (
                   <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs leading-5 text-rose-700">
@@ -1433,15 +1434,15 @@ export function ResearchWorkbench() {
                 <section id="topic-review-panel" className="scroll-mt-24 rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
                   <SectionTitle
                     eyebrow="ChatGPT Pro Topic Review"
-                    title={autoSourceQuestion ? "선택한 지식iN 질문을 ChatGPT Pro에서 최종 심사" : "오늘의 데이터가 담긴 프롬프트를 ChatGPT Pro에서 직접 심사"}
-                    description={autoSourceQuestion ? "입력한 지식iN 원문을 기준점으로 주변 독립 질문과 NAVER 5개 보조 신호를 다시 수집했습니다. 프롬프트를 ChatGPT Pro에 입력해 신규 글 가치, 기존 글 업데이트 여부, 공식 원문 검증 가능성을 최종 판단합니다." : "Evidence Bundle이 포함된 심사 프롬프트를 ChatGPT Pro에 입력하면 최대 3개의 주제를 추천합니다. 그 대화에서 1·2·3 중 하나만 선택하면 조사·검증형은 별도 확인 요청 없이 공식 원문 재검증부터 Auto Publisher용 WordPress 원고 작성까지 이어서 진행합니다. 직접 테스트형만 실제 테스트 결과가 필요합니다."}
+                    title={autoSourceQuestion ? "선택한 지식iN 질문을 바로 검증·작성" : "오늘의 데이터가 담긴 프롬프트를 ChatGPT Pro에서 직접 심사"}
+                    description={autoSourceQuestion ? "입력한 원문 질문은 이미 사용자가 선택했으므로 추천 순위와 번호 선택 단계를 건너뜁니다. ChatGPT Pro가 내부적으로 게시 가치·기존 글 중복·공식 근거를 검증하고, 조사·검증형으로 통과하면 같은 답변에서 바로 # 1 게시용 본문부터 # 4 지식iN 답변 추천까지 완성합니다. 직접 테스트가 꼭 필요한 경우에만 테스트 계획에서 멈춥니다." : "Evidence Bundle이 포함된 심사 프롬프트를 ChatGPT Pro에 입력하면 최대 3개의 주제를 추천합니다. 그 대화에서 1·2·3 중 하나만 선택하면 조사·검증형은 별도 확인 요청 없이 공식 원문 재검증부터 Auto Publisher용 WordPress 원고 작성까지 이어서 진행합니다. 직접 테스트형만 실제 테스트 결과가 필요합니다."}
                   />
 
                   <div className="mb-5 rounded-2xl border border-zinc-200 bg-zinc-50 p-4">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
-                        <div className="text-xs font-semibold text-zinc-700">ChatGPT Pro에 입력할 주제 심사 프롬프트</div>
-                        <p className="mt-1 text-[11px] leading-5 text-zinc-400">{autoSourceQuestion ? "선택한 원문 질문과 유사 독립 질문, 검색어트렌드·카페·블로그·뉴스·웹문서 Evidence JSON이 포함되어 있습니다." : "오늘 수집한 지식iN 질문과 검색어트렌드·카페·블로그·뉴스·웹문서 Evidence JSON이 포함되어 있습니다."} 앱은 이 프롬프트를 만들기만 하며, 실제 주제 선정은 ChatGPT Pro가 합니다.</p>
+                        <div className="text-xs font-semibold text-zinc-700">{autoSourceQuestion ? "ChatGPT Pro에 입력할 최종 작성 프롬프트" : "ChatGPT Pro에 입력할 주제 심사 프롬프트"}</div>
+                        <p className="mt-1 text-[11px] leading-5 text-zinc-400">{autoSourceQuestion ? "선택한 원문 질문과 유사 독립 질문, 검색어트렌드·카페·블로그·뉴스·웹문서 Evidence JSON이 포함되어 있습니다. 후보 비교는 하지 않고 내부 검증을 통과하면 곧바로 최종 WordPress 아웃풋을 작성하도록 지시합니다." : "오늘 수집한 지식iN 질문과 검색어트렌드·카페·블로그·뉴스·웹문서 Evidence JSON이 포함되어 있습니다. 앱은 이 프롬프트를 만들기만 하며, 실제 주제 선정은 ChatGPT Pro가 합니다."}</p>
                       </div>
                       <button type="button" onClick={() => void copyAutoReviewPrompt()} className={classNames("inline-flex min-w-0 items-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition", autoReviewPromptCopied ? "bg-emerald-700 text-white" : "bg-zinc-900 text-white hover:bg-zinc-800")}>
                         {autoReviewPromptCopied ? <CheckIcon className="h-3.5 w-3.5 shrink-0" /> : <CopyIcon className="h-3.5 w-3.5 shrink-0" />}
@@ -1474,14 +1475,25 @@ export function ResearchWorkbench() {
                     </div>
                     <div className="rounded-2xl border border-zinc-200 p-4">
                       <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">수동 제어 흐름</div>
-                      <ol className="mt-2 space-y-1.5 text-xs leading-5 text-zinc-600">
-                        <li>1. NAVER 데이터 수집</li>
-                        <li>2. 생성된 프롬프트를 내가 확인·복사</li>
-                        <li>3. ChatGPT Pro가 주제를 비교·추천</li>
-                        <li>4. 내가 1·2·3 중 하나만 선택</li>
-                        <li>5. 조사·검증형은 공식 원문 재검증 후 바로 WordPress 원고 작성</li>
-                        <li>6. 직접 테스트형만 실제 결과를 기록한 뒤 원고 작성</li>
-                      </ol>
+                      {autoSourceQuestion ? (
+                        <ol className="mt-2 space-y-1.5 text-xs leading-5 text-zinc-600">
+                          <li>1. 선택한 지식iN 원문을 기준으로 Evidence 수집</li>
+                          <li>2. 최종 작성 프롬프트를 내가 확인·복사</li>
+                          <li>3. ChatGPT Pro가 게시 가치·기존 글 중복을 내부 검증</li>
+                          <li>4. 공식 1차 출처를 현재 기준으로 재검증</li>
+                          <li>5. 통과하면 선택 단계 없이 # 1~# 4 최종 아웃풋 작성</li>
+                          <li>6. 테스트가 필수인 경우에만 실제 결과 입력 전까지 보류</li>
+                        </ol>
+                      ) : (
+                        <ol className="mt-2 space-y-1.5 text-xs leading-5 text-zinc-600">
+                          <li>1. NAVER 데이터 수집</li>
+                          <li>2. 생성된 프롬프트를 내가 확인·복사</li>
+                          <li>3. ChatGPT Pro가 주제를 비교·추천</li>
+                          <li>4. 내가 1·2·3 중 하나만 선택</li>
+                          <li>5. 조사·검증형은 공식 원문 재검증 후 바로 WordPress 원고 작성</li>
+                          <li>6. 직접 테스트형만 실제 결과를 기록한 뒤 원고 작성</li>
+                        </ol>
+                      )}
                     </div>
                   </div>
 
@@ -1562,6 +1574,7 @@ export function ResearchWorkbench() {
                     <pre className="mt-3 max-h-72 w-full min-w-0 max-w-full overflow-auto whitespace-pre-wrap break-all rounded-xl bg-zinc-950 p-4 text-[10px] leading-5 text-zinc-300">{JSON.stringify(autoEvidenceBundles, null, 2)}</pre>
                   </details>
 
+                  {!autoSourceQuestion ? (
                   <div className="mt-5 border-t border-zinc-100 pt-5">
                     <label className="block">
                       <span className="text-xs font-semibold text-zinc-700">선택 사항 · ChatGPT Pro 심사 결과를 앱에 보관</span>
@@ -1583,6 +1596,7 @@ export function ResearchWorkbench() {
                       <CheckIcon className="h-4 w-4" /> ChatGPT Pro 선정 후보 불러오기
                     </button>
                   </div>
+                  ) : null}
                 </section>
               ) : null}
 
