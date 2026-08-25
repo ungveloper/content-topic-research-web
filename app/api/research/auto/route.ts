@@ -94,6 +94,7 @@ type SearchPerformanceInput = {
 
 type AutoRequest = {
   offset?: number;
+  sourceUrl?: string;
   usedTopics?: TopicHistory[];
   siteUrl?: string;
   siteContents?: SiteContentRecord[];
@@ -182,6 +183,110 @@ function isOfficialUrl(value?: string) {
   if (!hostname) return false;
   if (hostname.endsWith(".go.kr")) return true;
   return OFFICIAL_HOSTS.some((host) => hostname === host || hostname.endsWith(`.${host}`));
+}
+
+
+type KinSourceQuestion = {
+  url: string;
+  title: string;
+  description?: string;
+};
+
+function decodeHtmlEntities(value: string) {
+  return value
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, decimal: string) => String.fromCodePoint(Number.parseInt(decimal, 10)));
+}
+
+function metaContent(html: string, key: string) {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const patterns = [
+    new RegExp(`<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, "i"),
+    new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+(?:property|name)=["']${escaped}["'][^>]*>`, "i"),
+  ];
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match?.[1]) return decodeHtmlEntities(match[1]).replace(/\s+/g, " ").trim();
+  }
+  return "";
+}
+
+function normalizeKinSourceUrl(value: string) {
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    throw new Error("올바른 네이버 지식iN 원문 URL을 입력해주세요.");
+  }
+  const hostname = url.hostname.toLowerCase();
+  if (hostname !== "kin.naver.com" && hostname !== "m.kin.naver.com") {
+    throw new Error("네이버 지식iN(kin.naver.com) 원문 URL만 사용할 수 있습니다.");
+  }
+  if (!url.searchParams.get("docId") && !/\/qna\//i.test(url.pathname)) {
+    throw new Error("지식iN 질문 원문 URL을 확인해주세요. 질문 상세 페이지 주소가 필요합니다.");
+  }
+  url.hash = "";
+  ["utm_source", "utm_medium", "utm_campaign", "query", "sm", "where", "from"].forEach((key) => url.searchParams.delete(key));
+  return url.toString();
+}
+
+async function fetchKinSourceQuestion(sourceUrl: string): Promise<KinSourceQuestion> {
+  const url = normalizeKinSourceUrl(sourceUrl);
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+      Accept: "text/html,application/xhtml+xml",
+      "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.7",
+    },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`지식iN 원문을 열지 못했습니다. HTTP ${response.status}`);
+  }
+  const html = await response.text();
+  const rawTitle = metaContent(html, "og:title") || metaContent(html, "twitter:title") || decodeHtmlEntities(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "");
+  const rawDescription = metaContent(html, "og:description") || metaContent(html, "description") || metaContent(html, "twitter:description");
+  const title = stripHtml(rawTitle)
+    .replace(/\s*[:|\-]\s*(네이버\s*)?지식iN.*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const description = stripHtml(rawDescription).replace(/\s+/g, " ").trim();
+  if (!title || title.length < 2) {
+    throw new Error("지식iN 원문에서 질문 제목을 확인하지 못했습니다. 원문이 공개 상태인지 확인해주세요.");
+  }
+  return { url, title, description: description || undefined };
+}
+
+function anchorCoreQueries(title: string) {
+  const cleaned = cleanProblemTitle(title);
+  const tokens = topicTokens(cleaned).slice(0, 4);
+  const variants = [cleaned, tokens.join(" ")]
+    .map((value) => value.replace(/\s+/g, " ").trim())
+    .filter((value) => value.length >= 2);
+  return Array.from(new Set(variants)).slice(0, 2);
+}
+
+function chooseAnchorSeed(title: string, seeds: AutoResearchSeed[]) {
+  const sorted = [...seeds].sort((a, b) => {
+    const scoreA = topicSimilarity(title, `${a.query} ${a.audience}`);
+    const scoreB = topicSimilarity(title, `${b.query} ${b.audience}`);
+    return scoreB - scoreA;
+  });
+  return sorted[0] || seeds[0];
+}
+
+function inferInternalCategoryLabel(text: string) {
+  const value = text.toLowerCase();
+  if (/(아이폰|갤럭시|스마트폰|휴대폰|컴퓨터|노트북|윈도우|맥북|앱|계정|백업|복원|동기화|와이파이|블루투스|파일|사진|저장공간|데이터)/.test(value)) return "디지털 생활";
+  if (/(대형폐기물|폐가전|쓰레기|배출|신청|신고|주민센터|구청|시청|공공시설|서류|주소 변경|이사.*절차)/.test(value)) return "생활 행정";
+  if (/(정리|수납|보관|옷장|이불|주방|식품|공간|습기|곰팡이.*보관)/.test(value)) return "정리·보관";
+  if (/(사용법|사용 방법|제품|기기|설정|설치|조립|소모품|필터 교체|충전기|리모컨)/.test(value)) return "제품 사용";
+  return "집 관리";
 }
 
 function safeNumber(value: unknown) {
@@ -742,62 +847,159 @@ export async function POST(request: NextRequest) {
   const naverCredentials: { clientId: string; clientSecret: string } = credentials;
 
   const offset = Math.max(0, Math.min(20, Number(body.offset) || 0));
+  const sourceUrl = typeof body.sourceUrl === "string" ? body.sourceUrl.trim() : "";
   const siteContents = (Array.isArray(body.siteContents) ? body.siteContents : []).slice(0, 500);
   const searchPerformance = (Array.isArray(body.searchPerformance) ? body.searchPerformance : []).slice(0, 500);
   const now = kstNow();
   const createdAt = new Date().toISOString();
-  const seeds = getAutoResearchSeeds(now, offset, 5);
-  const seedSummary = seeds.map((seed) => ({ query: seed.query, category: autoResearchCategoryLabel(seed.category) }));
+  const rotatingSeeds = getAutoResearchSeeds(now, offset, 5);
   const errors: string[] = [];
 
   const usedTopics = (Array.isArray(body.usedTopics) ? body.usedTopics : [])
     .filter((entry) => withinDays(entry.usedAt || entry.updatedAt, 60))
     .slice(-100);
 
-  // 1) 지식iN은 문제 발견만 담당합니다.
-  // 최근성은 "recent lane(sort=date)"으로 우선 반영하지만, 오래된 에버그린 문제를 버리지 않도록
-  // 제한된 "evergreen lane(sort=sim)"도 함께 회수합니다. 날짜는 가산점이지 하드 컷오프가 아닙니다.
-  const discovered: DiscoveredProblem[] = [];
-  for (const seed of seeds) {
-    const config = DISCOVERY_TYPES[0];
-    const settled = await Promise.allSettled(
-      DISCOVERY_LANES.map(async (lane) => ({
-        lane,
-        items: await searchNaver(naverCredentials, seed.query, config, { sort: lane.sort, display: lane.display }),
-      })),
-    );
+  let sourceQuestion: KinSourceQuestion | undefined;
+  let anchorSeed: AutoResearchSeed | undefined;
+  if (sourceUrl) {
+    try {
+      sourceQuestion = await fetchKinSourceQuestion(sourceUrl);
+    } catch (error) {
+      return NextResponse.json(
+        { error: error instanceof Error ? error.message : "지식iN 원문을 확인하지 못했습니다." },
+        { status: 400 },
+      );
+    }
 
-    settled.forEach((result, index) => {
-      const lane = DISCOVERY_LANES[index];
-      if (result.status === "rejected") {
-        const message = result.reason instanceof Error ? result.reason.message : "검색 실패";
-        errors.push(`${autoResearchCategoryLabel(seed.category)} · kin/${lane.label}: ${message}`);
-        return;
-      }
-
-      result.value.items.forEach((item) => {
-        const rawTitle = stripHtml(item.title || "").trim();
-        const title = cleanProblemTitle(rawTitle);
-        if (isExcludedContentTopic(`${rawTitle} ${item.description || ""}`)) return;
-        if (!isUsefulProblemTitle(title, seed.query)) return;
-        if (blockedByHistory(title, usedTopics, true)) return;
-
-        discovered.push({
-          category: seed.category,
-          seed,
-          title,
-          rawTitle,
-          kind: config.kind,
-          item,
-          discoveryPriority: problemSignalPriority(rawTitle) + lane.priorityBoost,
-        });
-      });
-    });
+    if (isExcludedContentTopic(`${sourceQuestion.title} ${sourceQuestion.description || ""}`)) {
+      return NextResponse.json(
+        { error: "이 질문은 의료·법률·금융·전문 안전 등 자동 콘텐츠 조사 제외 범위에 해당합니다." },
+        { status: 422 },
+      );
+    }
+    anchorSeed = chooseAnchorSeed(sourceQuestion.title, rotatingSeeds);
   }
 
-  const clusters = clusterProblems(dedupeDiscoveredProblems(discovered))
-    .filter((cluster) => !blockedByHistory(cluster.title, usedTopics, true));
-  const reviewClusters = selectReviewClusters(clusters, MAX_REVIEW_BUNDLES);
+  const seeds = sourceQuestion && anchorSeed ? [anchorSeed] : rotatingSeeds;
+  const seedSummary = sourceQuestion
+    ? [{ query: sourceQuestion.title, category: inferInternalCategoryLabel(`${sourceQuestion.title} ${sourceQuestion.description || ""}`) }]
+    : seeds.map((seed) => ({ query: seed.query, category: autoResearchCategoryLabel(seed.category) }));
+
+  // 1) 지식iN은 문제 발견만 담당합니다.
+  // 원문 URL이 있으면 해당 질문을 반드시 기준점으로 넣고, 주변의 독립 질문만 추가로 찾습니다.
+  // 일반 자동 탐색은 최신순 + 제한적 관련도순을 병행해 최근성과 에버그린성을 함께 봅니다.
+  const discovered: DiscoveredProblem[] = [];
+  const config = DISCOVERY_TYPES[0];
+
+  if (sourceQuestion && anchorSeed) {
+    const anchorTitle = cleanProblemTitle(sourceQuestion.title) || sourceQuestion.title;
+    const anchorItem: SearchItem = {
+      title: sourceQuestion.title,
+      link: sourceQuestion.url,
+      description: sourceQuestion.description,
+    };
+    discovered.push({
+      category: anchorSeed.category,
+      seed: anchorSeed,
+      title: anchorTitle,
+      rawTitle: sourceQuestion.title,
+      kind: config.kind,
+      item: anchorItem,
+      discoveryPriority: 100,
+    });
+
+    for (const relatedQuery of anchorCoreQueries(anchorTitle)) {
+      const settled = await Promise.allSettled(
+        DISCOVERY_LANES.map(async (lane) => ({
+          lane,
+          items: await searchNaver(naverCredentials, relatedQuery, config, { sort: lane.sort, display: lane.display }),
+        })),
+      );
+      settled.forEach((result, index) => {
+        const lane = DISCOVERY_LANES[index];
+        if (result.status === "rejected") {
+          const message = result.reason instanceof Error ? result.reason.message : "검색 실패";
+          errors.push(`원문 연관 질문 · kin/${lane.label}: ${message}`);
+          return;
+        }
+        result.value.items.forEach((item) => {
+          const rawTitle = stripHtml(item.title || "").trim();
+          const title = cleanProblemTitle(rawTitle);
+          if (isExcludedContentTopic(`${rawTitle} ${item.description || ""}`)) return;
+          if (!isUsefulProblemTitle(title, relatedQuery)) return;
+          if (!(isSameTopicCluster(anchorTitle, title) || topicSimilarity(anchorTitle, title) >= 0.3)) return;
+          discovered.push({
+            category: anchorSeed!.category,
+            seed: anchorSeed!,
+            title,
+            rawTitle,
+            kind: config.kind,
+            item,
+            discoveryPriority: problemSignalPriority(rawTitle) + lane.priorityBoost,
+          });
+        });
+      });
+    }
+  } else {
+    for (const seed of seeds) {
+      const settled = await Promise.allSettled(
+        DISCOVERY_LANES.map(async (lane) => ({
+          lane,
+          items: await searchNaver(naverCredentials, seed.query, config, { sort: lane.sort, display: lane.display }),
+        })),
+      );
+
+      settled.forEach((result, index) => {
+        const lane = DISCOVERY_LANES[index];
+        if (result.status === "rejected") {
+          const message = result.reason instanceof Error ? result.reason.message : "검색 실패";
+          errors.push(`${autoResearchCategoryLabel(seed.category)} · kin/${lane.label}: ${message}`);
+          return;
+        }
+
+        result.value.items.forEach((item) => {
+          const rawTitle = stripHtml(item.title || "").trim();
+          const title = cleanProblemTitle(rawTitle);
+          if (isExcludedContentTopic(`${rawTitle} ${item.description || ""}`)) return;
+          if (!isUsefulProblemTitle(title, seed.query)) return;
+          if (blockedByHistory(title, usedTopics, true)) return;
+
+          discovered.push({
+            category: seed.category,
+            seed,
+            title,
+            rawTitle,
+            kind: config.kind,
+            item,
+            discoveryPriority: problemSignalPriority(rawTitle) + lane.priorityBoost,
+          });
+        });
+      });
+    }
+  }
+
+  let reviewClusters: ProblemCluster[];
+  if (sourceQuestion && anchorSeed) {
+    const deduped = dedupeDiscoveredProblems(discovered);
+    const anchorTitle = cleanProblemTitle(sourceQuestion.title) || sourceQuestion.title;
+    const anchorProblems = deduped.filter((problem) =>
+      canonicalQuestionUrl(problem.item) === normalizeKinSourceUrl(sourceQuestion!.url)
+      || isSameTopicCluster(anchorTitle, problem.title)
+      || topicSimilarity(anchorTitle, problem.title) >= 0.3,
+    );
+    reviewClusters = [{
+      category: anchorSeed.category,
+      seed: anchorSeed,
+      title: anchorTitle,
+      rawTitles: Array.from(new Set(anchorProblems.map((problem) => problem.rawTitle))),
+      items: anchorProblems.map((problem) => ({ kind: problem.kind, item: problem.item })),
+      discoveryPriority: anchorProblems.reduce((sum, problem) => sum + Math.max(1, problem.discoveryPriority), 0),
+    }];
+  } else {
+    const clusters = clusterProblems(dedupeDiscoveredProblems(discovered))
+      .filter((cluster) => !blockedByHistory(cluster.title, usedTopics, true));
+    reviewClusters = selectReviewClusters(clusters, MAX_REVIEW_BUNDLES);
+  }
 
   const cooldown = {
     usedDays: 60,
@@ -820,6 +1022,7 @@ export async function POST(request: NextRequest) {
         `지식iN 검색은 완료됐지만 독립 질문 후보가 남지 않았습니다. 원시 발견 ${discovered.length}건 중 중복·금지 분야·실제 사용한 최근 주제만 제외했습니다. 단순 노출 이력은 더 이상 차단하지 않습니다.`,
       ].slice(0, 12),
       cooldown,
+      sourceQuestion,
     });
   }
 
@@ -928,7 +1131,9 @@ export async function POST(request: NextRequest) {
     const bundle: ResearchEvidenceBundle = {
       id: makeId("bundle"),
       query: cluster.title,
-      discoveryCategory: autoResearchCategoryLabel(cluster.category),
+      discoveryCategory: sourceQuestion
+        ? inferInternalCategoryLabel(`${sourceQuestion.title} ${sourceQuestion.description || ""}`)
+        : autoResearchCategoryLabel(cluster.category),
       discoveredProblem,
       sourceSignalIds: bundleSignals.map((signal) => signal.id),
       questions,
@@ -993,5 +1198,6 @@ export async function POST(request: NextRequest) {
     editorialContext,
     errors: Array.from(new Set(errors)).slice(0, 12),
     cooldown,
+    sourceQuestion,
   });
 }

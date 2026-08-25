@@ -86,6 +86,11 @@ type AutoResearchResponse = {
   evidenceBundles: ResearchEvidenceBundle[];
   reviewPrompt: string;
   editorialContext?: EditorialContext;
+  sourceQuestion?: {
+    url: string;
+    title: string;
+    description?: string;
+  };
   errors?: string[];
   cooldown?: {
     usedDays: number;
@@ -407,6 +412,10 @@ export function ResearchWorkbench() {
   const [autoReviewPrompt, setAutoReviewPrompt] = useState("");
   const [autoReviewOutput, setAutoReviewOutput] = useState("");
   const [autoReviewPromptCopied, setAutoReviewPromptCopied] = useState(false);
+  const [kinSourceUrl, setKinSourceUrl] = useState("");
+  const [kinUrlResearchLoading, setKinUrlResearchLoading] = useState(false);
+  const [kinUrlResearchError, setKinUrlResearchError] = useState<string | null>(null);
+  const [autoSourceQuestion, setAutoSourceQuestion] = useState<AutoResearchResponse["sourceQuestion"] | null>(null);
   const [usedTopics, setUsedTopics] = useState<UsedTopicHistory[]>([]);
   const [autoEditorialContext, setAutoEditorialContext] = useState<EditorialContext | null>(null);
   const [siteUrl, setSiteUrl] = useState("");
@@ -726,95 +735,140 @@ export function ResearchWorkbench() {
     }
   }
 
-  async function runAutoResearch(offset = 0) {
-    setAutoResearchLoading(true);
-    setAutoResearchError(null);
+  async function executeResearch(offset = 0, sourceUrl?: string) {
     setAutoResearchWarnings([]);
     setAutoResearchCooldown(null);
     setAutoEvidenceBundles([]);
     setAutoReviewPrompt("");
     setAutoReviewOutput("");
     setAutoReviewPromptCopied(false);
+    setAutoSourceQuestion(null);
 
-    try {
-      const response = await fetch("/api/research/auto", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          offset,
-          usedTopics: usedTopics.map((item) => ({
-            title: item.title,
-            problem: item.problem,
-            usedAt: item.usedAt,
+    const response = await fetch("/api/research/auto", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        offset,
+        sourceUrl: sourceUrl || undefined,
+        usedTopics: usedTopics.map((item) => ({
+          title: item.title,
+          problem: item.problem,
+          usedAt: item.usedAt,
+        })),
+        siteUrl: siteUrl.trim() || undefined,
+        siteContents: siteContents.slice(0, 500),
+        searchPerformance: signals
+          .filter((signal) => signal.kind === "search-console" && (signal.query || signal.title))
+          .slice(0, 500)
+          .map((signal) => ({
+            query: signal.query || signal.title,
+            clicks: signal.metrics?.clicks,
+            impressions: signal.metrics?.impressions,
+            ctr: signal.metrics?.ctr,
+            position: signal.metrics?.position,
           })),
-          siteUrl: siteUrl.trim() || undefined,
-          siteContents: siteContents.slice(0, 500),
-          searchPerformance: signals
-            .filter((signal) => signal.kind === "search-console" && (signal.query || signal.title))
-            .slice(0, 500)
-            .map((signal) => ({
-              query: signal.query || signal.title,
-              clicks: signal.metrics?.clicks,
-              impressions: signal.metrics?.impressions,
-              ctr: signal.metrics?.ctr,
-              position: signal.metrics?.position,
-            })),
-        }),
-      });
-      const data = (await response.json()) as AutoResearchResponse & { error?: string };
+      }),
+    });
+    const data = (await response.json()) as AutoResearchResponse & { error?: string };
 
-      if (!response.ok) {
-        throw new Error(data.error || "조사 데이터 수집에 실패했습니다.");
+    if (!response.ok) {
+      throw new Error(data.error || "조사 데이터 수집에 실패했습니다.");
+    }
+
+    const incomingSignals = Array.isArray(data.signals) ? data.signals : [];
+    const incomingBundles = Array.isArray(data.evidenceBundles) ? data.evidenceBundles : [];
+    const signalIdMap = new Map<string, string>();
+    const existingByKey = new Map(
+      signals.map((signal) => [
+        `${signal.kind}::${signal.title}::${signal.url || ""}`,
+        signal.id,
+      ]),
+    );
+    const freshSignals: Signal[] = [];
+
+    incomingSignals.forEach((signal) => {
+      const key = `${signal.kind}::${signal.title}::${signal.url || ""}`;
+      const existingId = existingByKey.get(key);
+      if (existingId) {
+        signalIdMap.set(signal.id, existingId);
+        return;
       }
+      existingByKey.set(key, signal.id);
+      signalIdMap.set(signal.id, signal.id);
+      freshSignals.push(signal);
+    });
 
-      const incomingSignals = Array.isArray(data.signals) ? data.signals : [];
-      const incomingBundles = Array.isArray(data.evidenceBundles) ? data.evidenceBundles : [];
-      const signalIdMap = new Map<string, string>();
-      const existingByKey = new Map(
-        signals.map((signal) => [
-          `${signal.kind}::${signal.title}::${signal.url || ""}`,
-          signal.id,
-        ]),
-      );
-      const freshSignals: Signal[] = [];
+    const normalizedBundles = incomingBundles.map((bundle) => ({
+      ...bundle,
+      sourceSignalIds: bundle.sourceSignalIds.map((id) => signalIdMap.get(id) || id),
+    }));
 
-      incomingSignals.forEach((signal) => {
-        const key = `${signal.kind}::${signal.title}::${signal.url || ""}`;
-        const existingId = existingByKey.get(key);
-        if (existingId) {
-          signalIdMap.set(signal.id, existingId);
-          return;
-        }
-        existingByKey.set(key, signal.id);
-        signalIdMap.set(signal.id, signal.id);
-        freshSignals.push(signal);
-      });
+    setSignals((current) => [...freshSignals, ...current]);
+    setAutoResearchOffset(offset);
+    setAutoResearchSeeds(Array.isArray(data.seeds) ? data.seeds : []);
+    setAutoResearchWarnings(Array.isArray(data.errors) ? data.errors : []);
+    setAutoResearchCooldown(data.cooldown || null);
+    setAutoEvidenceBundles(normalizedBundles);
+    setAutoReviewPrompt(typeof data.reviewPrompt === "string" ? data.reviewPrompt : "");
+    setAutoEditorialContext(data.editorialContext || null);
+    setAutoSourceQuestion(data.sourceQuestion || null);
 
-      const normalizedBundles = incomingBundles.map((bundle) => ({
-        ...bundle,
-        sourceSignalIds: bundle.sourceSignalIds.map((id) => signalIdMap.get(id) || id),
-      }));
+    if (normalizedBundles.length && data.reviewPrompt) {
+      window.setTimeout(() => {
+        document.getElementById("topic-review-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 0);
+    }
 
-      setSignals((current) => [...freshSignals, ...current]);
-      setAutoResearchOffset(offset);
-      setAutoResearchSeeds(Array.isArray(data.seeds) ? data.seeds : []);
-      setAutoResearchWarnings(Array.isArray(data.errors) ? data.errors : []);
-      setAutoResearchCooldown(data.cooldown || null);
-      setAutoEvidenceBundles(normalizedBundles);
-      setAutoReviewPrompt(typeof data.reviewPrompt === "string" ? data.reviewPrompt : "");
-      setAutoEditorialContext(data.editorialContext || null);
+    return { data, normalizedBundles };
+  }
 
-      if (normalizedBundles.length && data.reviewPrompt) {
-        window.setTimeout(() => {
-          document.getElementById("topic-review-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
-        }, 0);
-      } else {
+  async function runAutoResearch(offset = 0) {
+    setAutoResearchLoading(true);
+    setAutoResearchError(null);
+    setKinUrlResearchError(null);
+    try {
+      const { normalizedBundles } = await executeResearch(offset);
+      if (!normalizedBundles.length) {
         setToast("조사는 완료됐지만 이번 검색에서 중복·제외 기준을 통과한 독립 질문을 찾지 못했습니다. 이전에 보기만 한 후보는 더 이상 차단하지 않으므로 다시 조회해도 됩니다.");
       }
     } catch (error) {
       setAutoResearchError(error instanceof Error ? error.message : "조사 데이터 수집에 실패했습니다.");
     } finally {
       setAutoResearchLoading(false);
+    }
+  }
+
+  async function runKinUrlResearch() {
+    const sourceUrl = kinSourceUrl.trim();
+    if (!sourceUrl) {
+      setKinUrlResearchError("네이버 지식iN 원문 URL을 입력해주세요.");
+      return;
+    }
+    try {
+      const parsed = new URL(sourceUrl);
+      if (parsed.hostname !== "kin.naver.com" && parsed.hostname !== "m.kin.naver.com") {
+        setKinUrlResearchError("kin.naver.com 지식iN 질문 URL만 입력할 수 있습니다.");
+        return;
+      }
+    } catch {
+      setKinUrlResearchError("올바른 URL 형식인지 확인해주세요.");
+      return;
+    }
+
+    setKinUrlResearchLoading(true);
+    setKinUrlResearchError(null);
+    setAutoResearchError(null);
+    try {
+      const { normalizedBundles, data } = await executeResearch(0, sourceUrl);
+      if (!normalizedBundles.length || !data.reviewPrompt) {
+        setKinUrlResearchError(
+          (Array.isArray(data.errors) && data.errors[0]) || "원문은 확인했지만 심사에 넘길 Evidence Bundle을 만들지 못했습니다.",
+        );
+      }
+    } catch (error) {
+      setKinUrlResearchError(error instanceof Error ? error.message : "지식iN 원문 조사를 시작하지 못했습니다.");
+    } finally {
+      setKinUrlResearchLoading(false);
     }
   }
 
@@ -1312,19 +1366,82 @@ export function ResearchWorkbench() {
                 ) : null}
               </section>
 
+              <section className="w-full min-w-0 max-w-full overflow-hidden rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
+                <SectionTitle
+                  eyebrow="Focused Research"
+                  title="지식iN 원문으로 바로 조사"
+                  description="Notion에서 괜찮은 질문을 골랐거나 직접 발견한 지식iN 질문이 있다면 원문 URL 하나만 붙여넣으세요. 해당 질문을 고정 출발점으로 삼아 유사 독립 질문·검색어트렌드·카페·블로그·뉴스·웹문서를 다시 수집하고 기존 WordPress 글·Search Console 신호까지 같은 심사 로직에 연결합니다."
+                />
+                <form
+                  className="grid min-w-0 gap-3 lg:grid-cols-[minmax(0,1fr)_180px]"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void runKinUrlResearch();
+                  }}
+                >
+                  <div className="relative min-w-0">
+                    <ExternalIcon className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-400" />
+                    <input
+                      type="url"
+                      value={kinSourceUrl}
+                      onChange={(event) => {
+                        setKinSourceUrl(event.target.value);
+                        if (kinUrlResearchError) setKinUrlResearchError(null);
+                      }}
+                      placeholder="https://kin.naver.com/qna/detail.naver?..."
+                      className="w-full min-w-0 rounded-xl border border-zinc-200 bg-white py-3 pl-10 pr-3 text-sm outline-none placeholder:text-zinc-300 focus:border-zinc-400"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={kinUrlResearchLoading || !kinSourceUrl.trim()}
+                    className="flex min-w-0 items-center justify-center gap-2 rounded-xl bg-zinc-900 px-4 py-3 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {kinUrlResearchLoading ? (
+                      <>
+                        <span aria-hidden="true" className="h-4 w-4 animate-spin rounded-full border-2 border-zinc-400 border-t-white" />
+                        원문 조사 중...
+                      </>
+                    ) : (
+                      <>
+                        <SparkIcon className="h-4 w-4 shrink-0" />
+                        이 질문 조사하기
+                      </>
+                    )}
+                  </button>
+                </form>
+                <p className="mt-2 break-words text-[11px] leading-5 text-zinc-400 [overflow-wrap:anywhere]">
+                  URL을 넣었다고 바로 글을 만들지는 않습니다. 원문 질문을 먼저 확인하고, 같은 문제를 묻는 다른 질문과 최근 수요·에버그린성·공식 근거·기존 글 중복 가능성을 다시 조사한 뒤 ChatGPT Pro가 발행/보류/기존 글 업데이트 여부를 판단합니다.
+                </p>
+                {kinUrlResearchError ? (
+                  <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs leading-5 text-rose-700">
+                    {kinUrlResearchError}
+                  </div>
+                ) : null}
+                {autoSourceQuestion ? (
+                  <div className="mt-3 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 rounded-xl bg-zinc-50 px-4 py-3 text-xs text-zinc-500">
+                    <span className="font-medium text-zinc-700">원문 기준 조사</span>
+                    <span className="min-w-0 break-words [overflow-wrap:anywhere]">{autoSourceQuestion.title}</span>
+                    <a href={autoSourceQuestion.url} target="_blank" rel="noreferrer" className="inline-flex shrink-0 items-center gap-1 font-medium text-zinc-500 hover:text-zinc-900">
+                      원문 <ExternalIcon className="h-3 w-3" />
+                    </a>
+                  </div>
+                ) : null}
+              </section>
+
               {autoReviewPrompt || autoEvidenceBundles.length ? (
                 <section id="topic-review-panel" className="scroll-mt-24 rounded-3xl border border-zinc-200 bg-white p-5 sm:p-6">
                   <SectionTitle
                     eyebrow="ChatGPT Pro Topic Review"
-                    title="오늘의 데이터가 담긴 프롬프트를 ChatGPT Pro에서 직접 심사"
-                    description="Evidence Bundle이 포함된 심사 프롬프트를 ChatGPT Pro에 입력하면 최대 3개의 주제를 추천합니다. 그 대화에서 1·2·3 중 하나만 선택하면 조사·검증형은 별도 확인 요청 없이 공식 원문 재검증부터 Auto Publisher용 WordPress 원고 작성까지 이어서 진행합니다. 직접 테스트형만 실제 테스트 결과가 필요합니다."
+                    title={autoSourceQuestion ? "선택한 지식iN 질문을 ChatGPT Pro에서 최종 심사" : "오늘의 데이터가 담긴 프롬프트를 ChatGPT Pro에서 직접 심사"}
+                    description={autoSourceQuestion ? "입력한 지식iN 원문을 기준점으로 주변 독립 질문과 NAVER 5개 보조 신호를 다시 수집했습니다. 프롬프트를 ChatGPT Pro에 입력해 신규 글 가치, 기존 글 업데이트 여부, 공식 원문 검증 가능성을 최종 판단합니다." : "Evidence Bundle이 포함된 심사 프롬프트를 ChatGPT Pro에 입력하면 최대 3개의 주제를 추천합니다. 그 대화에서 1·2·3 중 하나만 선택하면 조사·검증형은 별도 확인 요청 없이 공식 원문 재검증부터 Auto Publisher용 WordPress 원고 작성까지 이어서 진행합니다. 직접 테스트형만 실제 테스트 결과가 필요합니다."}
                   />
 
                   <div className="mb-5 rounded-2xl border border-zinc-200 bg-zinc-50 p-4">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
                         <div className="text-xs font-semibold text-zinc-700">ChatGPT Pro에 입력할 주제 심사 프롬프트</div>
-                        <p className="mt-1 text-[11px] leading-5 text-zinc-400">오늘 수집한 지식iN 질문과 검색어트렌드·카페·블로그·뉴스·웹문서 Evidence JSON이 포함되어 있습니다. 앱은 이 프롬프트를 만들기만 하며, 실제 주제 선정은 ChatGPT Pro가 합니다.</p>
+                        <p className="mt-1 text-[11px] leading-5 text-zinc-400">{autoSourceQuestion ? "선택한 원문 질문과 유사 독립 질문, 검색어트렌드·카페·블로그·뉴스·웹문서 Evidence JSON이 포함되어 있습니다." : "오늘 수집한 지식iN 질문과 검색어트렌드·카페·블로그·뉴스·웹문서 Evidence JSON이 포함되어 있습니다."} 앱은 이 프롬프트를 만들기만 하며, 실제 주제 선정은 ChatGPT Pro가 합니다.</p>
                       </div>
                       <button type="button" onClick={() => void copyAutoReviewPrompt()} className={classNames("inline-flex min-w-0 items-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition", autoReviewPromptCopied ? "bg-emerald-700 text-white" : "bg-zinc-900 text-white hover:bg-zinc-800")}>
                         {autoReviewPromptCopied ? <CheckIcon className="h-3.5 w-3.5 shrink-0" /> : <CopyIcon className="h-3.5 w-3.5 shrink-0" />}
