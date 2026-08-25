@@ -45,6 +45,7 @@ const hardExcludeGroups = {
   "의료·건강": [
     "병원", "의사", "약사", "약 ", "약물", "복용", "처방", "증상", "진단", "치료", "질환", "질병",
     "수술", "통증", "혈압", "혈당", "임신", "생리", "영양제", "다이어트", "칼로리", "건강검진",
+    "출혈", "혈변", "대변", "기침", "구토", "설사", "항문", "피부질환", "두통", "발열", "상처", "감염",
   ],
   "법률·분쟁": [
     "고소", "고발", "소송", "변호사", "법률", "법적", "처벌", "형사", "민사", "합의금", "손해배상",
@@ -150,10 +151,18 @@ async function main() {
   }
 
   let created = 0;
-  for (const candidate of clustered) {
+  for (const rawCandidate of clustered) {
     if (created >= MAX_PAGES_PER_RUN) break;
-    if (await notionHasUrl(candidate.link, notionProperties.url.name)) {
-      console.log(`[KIN monitor] 이미 등록됨: ${candidate.title}`);
+    if (await notionHasUrl(rawCandidate.link, notionProperties.url.name)) {
+      console.log(`[KIN monitor] 이미 등록됨: ${rawCandidate.title}`);
+      await sleep(360);
+      continue;
+    }
+
+    const candidate = await hydrateKinQuestion(rawCandidate);
+    const validation = validateHydratedQuestion(candidate);
+    if (!validation.ok) {
+      console.log(`[KIN monitor] 원문 재검증 제외: ${candidate.title} · ${validation.reason}`);
       await sleep(360);
       continue;
     }
@@ -195,6 +204,167 @@ async function searchKin(query) {
   if (!response.ok) throw new Error(`NAVER ${response.status}: ${text.slice(0, 300)}`);
   const data = safeJson(text);
   return Array.isArray(data?.items) ? data.items : [];
+}
+
+async function hydrateKinQuestion(candidate) {
+  const canonicalUrl = canonicalKinQuestionUrl(candidate.link);
+  try {
+    const response = await fetch(canonicalUrl, {
+      headers: {
+        Accept: "text/html,application/xhtml+xml",
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.5",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136 Safari/537.36",
+      },
+      redirect: "follow",
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const html = await response.text();
+    const questionText = extractKinQuestionText(html);
+    const pageTitle = extractKinQuestionTitle(html);
+    if (!questionText) {
+      console.warn(`[KIN monitor] 질문 본문 추출 실패: ${canonicalUrl}`);
+    }
+    return {
+      ...candidate,
+      link: canonicalUrl,
+      title: pageTitle || candidate.title,
+      questionText,
+      questionTextVerified: Boolean(questionText),
+    };
+  } catch (error) {
+    console.warn(`[KIN monitor] 질문 원문 확인 실패: ${canonicalUrl} · ${error instanceof Error ? error.message : String(error)}`);
+    return {
+      ...candidate,
+      link: canonicalUrl,
+      questionText: "",
+      questionTextVerified: false,
+    };
+  }
+}
+
+function validateHydratedQuestion(candidate) {
+  // Naver 검색 API의 description은 답변 스니펫일 수 있으므로 최종 등록 판단에는 사용하지 않습니다.
+  const sourceText = `${candidate.title} ${candidate.questionText || ""}`.toLowerCase();
+  const excludedBy = findExcludedGroup(sourceText);
+  if (excludedBy) return { ok: false, reason: `제외 분야(${excludedBy})` };
+
+  const areaScores = Object.entries(areaTerms).map(([area, terms]) => [area, countMatches(sourceText, terms)]);
+  areaScores.sort((a, b) => b[1] - a[1]);
+  const [bestArea, areaHits] = areaScores[0] || [candidate.area || candidate.seedArea || "생활 가이드", 0];
+  const problemHits = countMatches(sourceText, problemTerms);
+  const hasQuestionMark = candidate.title.includes("?");
+
+  // 질문 본문을 읽은 경우에는 실제 질문 내용에서 생활 가이드 범위가 확인되어야 합니다.
+  if (candidate.questionTextVerified && areaHits === 0) {
+    return { ok: false, reason: "실제 질문 본문이 생활 가이드 범위와 맞지 않음" };
+  }
+  if (candidate.questionTextVerified && problemHits === 0 && !hasQuestionMark) {
+    return { ok: false, reason: "실제 질문에서 해결해야 할 문제 의도가 약함" };
+  }
+
+  candidate.area = bestArea || candidate.area || candidate.seedArea || "생활 가이드";
+  return { ok: true };
+}
+
+function extractKinQuestionText(html) {
+  const candidates = [
+    extractHtmlByClass(html, "questionDetail"),
+    extractHtmlByClass(html, "c-heading__content"),
+    extractHtmlByClass(html, "question-content"),
+    extractHtmlByClass(html, "_endContentsText"),
+  ];
+  for (const value of candidates) {
+    const text = htmlToText(value);
+    if (text.length >= 2) return text.slice(0, 1800);
+  }
+  return "";
+}
+
+function extractKinQuestionTitle(html) {
+  const ogTitle = extractMetaContent(html, "og:title");
+  if (ogTitle) return cleanKinTitle(htmlToText(ogTitle));
+  const titleBlock = htmlToText(extractHtmlByClass(html, "title"));
+  if (titleBlock) return cleanKinTitle(titleBlock);
+  const titleTag = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "";
+  return cleanKinTitle(htmlToText(titleTag));
+}
+
+function cleanKinTitle(value) {
+  return cleanText(value)
+    .replace(/^질문\s*/i, "")
+    .replace(/\s*[:|\-]\s*지식iN.*$/i, "")
+    .trim()
+    .slice(0, 180);
+}
+
+function extractHtmlByClass(html, className) {
+  const escaped = escapeRegExp(className);
+  const pattern = new RegExp(`<([a-z0-9]+)[^>]*class=["'][^"']*(?:^|\\s)${escaped}(?:\\s|$)[^"']*["'][^>]*>([\\s\\S]*?)<\\/\\1>`, "i");
+  return html.match(pattern)?.[2] || "";
+}
+
+function extractMetaContent(html, propertyName) {
+  const escaped = escapeRegExp(propertyName);
+  const patterns = [
+    new RegExp(`<meta[^>]+property=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, "i"),
+    new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+property=["']${escaped}["'][^>]*>`, "i"),
+  ];
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return "";
+}
+
+function htmlToText(value) {
+  if (!value) return "";
+  return decodeHtmlEntities(
+    String(value)
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<br\s*\/?\s*>/gi, "\n")
+      .replace(/<\/p\s*>/gi, "\n")
+      .replace(/<[^>]+>/g, " "),
+  )
+    .replace(/[\t\r ]+/g, " ")
+    .replace(/\n\s+/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function decodeHtmlEntities(value) {
+  const named = {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+    nbsp: " ",
+  };
+  return String(value)
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&([a-z]+);/gi, (match, name) => named[name.toLowerCase()] ?? match);
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function canonicalKinQuestionUrl(value) {
+  try {
+    const url = new URL(value);
+    if (!/(^|\.)kin\.naver\.com$/i.test(url.hostname)) return normalizeUrl(value);
+    const dirId = url.searchParams.get("dirId") || "";
+    const docId = url.searchParams.get("docId") || "";
+    if (!docId) return normalizeUrl(value);
+    const canonical = new URL("https://kin.naver.com/qna/detail.naver");
+    if (dirId) canonical.searchParams.set("dirId", dirId);
+    canonical.searchParams.set("docId", docId);
+    return canonical.toString();
+  } catch {
+    return String(value || "").trim();
+  }
 }
 
 function analyzeQuestion(item) {
@@ -393,7 +563,12 @@ async function createNotionPage(candidate, props) {
   if (props.score) properties[props.score.name] = { number: round1(candidate.totalScore) };
   if (props.evergreen) properties[props.evergreen.name] = { number: candidate.evergreenScore };
   if (props.demand) properties[props.demand.name] = { number: candidate.independentQuestionCount };
-  if (props.summary) properties[props.summary.name] = { rich_text: richText(candidate.description || candidate.title, 800) };
+  if (props.summary) {
+    const summary = candidate.questionTextVerified
+      ? candidate.questionText
+      : "원문 질문 본문을 자동으로 확인하지 못했습니다. 원문 URL에서 직접 확인이 필요합니다.";
+    properties[props.summary.name] = { rich_text: richText(summary, 1200) };
+  }
   setExistingSelect(properties, props.category, "생활 가이드");
   setExistingSelect(properties, props.area, candidate.area);
   setExistingSelect(properties, props.status, "검토 전");
@@ -407,8 +582,10 @@ async function createNotionPage(candidate, props) {
     `**최신성 힌트:** 지식iN 최신순 결과 ${candidate.dateRank}위에서 신규 발견`,
     `**탐색어:** ${candidate.matchedSeeds.join(" · ")}`,
     "",
-    `**질문 요약**`,
-    candidate.description || "설명 없음",
+    `**질문 원문 내용**`,
+    candidate.questionTextVerified
+      ? candidate.questionText
+      : "원문 질문 본문을 자동으로 확인하지 못했습니다. 답변 스니펫으로 대체하지 않았으므로 원문 URL에서 직접 확인해주세요.",
     "",
     `**원문**`,
     candidate.link,
@@ -491,6 +668,16 @@ function normalizeUrl(value) {
   if (!value) return "";
   try {
     const url = new URL(value);
+    if (/(^|\.)kin\.naver\.com$/i.test(url.hostname) && /\/qna\/detail\.naver$/i.test(url.pathname)) {
+      const dirId = url.searchParams.get("dirId") || "";
+      const docId = url.searchParams.get("docId") || "";
+      if (docId) {
+        const canonical = new URL("https://kin.naver.com/qna/detail.naver");
+        if (dirId) canonical.searchParams.set("dirId", dirId);
+        canonical.searchParams.set("docId", docId);
+        return canonical.toString();
+      }
+    }
     ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"].forEach((key) => url.searchParams.delete(key));
     url.hash = "";
     return url.toString();
