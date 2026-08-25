@@ -207,39 +207,79 @@ async function searchKin(query) {
 }
 
 async function hydrateKinQuestion(candidate) {
-  const canonicalUrl = canonicalKinQuestionUrl(candidate.link);
-  try {
-    const response = await fetch(canonicalUrl, {
-      headers: {
-        Accept: "text/html,application/xhtml+xml",
-        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.5",
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136 Safari/537.36",
-      },
-      redirect: "follow",
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const html = await response.text();
-    const questionText = extractKinQuestionText(html);
-    const pageTitle = extractKinQuestionTitle(html);
-    if (!questionText) {
-      console.warn(`[KIN monitor] 질문 본문 추출 실패: ${canonicalUrl}`);
+  const urls = kinQuestionFetchUrls(candidate.link);
+  let lastError = "";
+
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, {
+        headers: {
+          Accept: "text/html,application/xhtml+xml",
+          "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.5",
+          // 모바일 페이지가 질문 본문을 서버 HTML에 더 안정적으로 포함하는 경우가 있어 모바일 UA를 우선 사용합니다.
+          "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
+        },
+        redirect: "follow",
+      });
+      if (!response.ok) {
+        lastError = `HTTP ${response.status}`;
+        continue;
+      }
+
+      const html = await response.text();
+      const questionText = extractKinQuestionText(html);
+      const pageTitle = extractKinQuestionTitle(html);
+      if (!questionText) {
+        lastError = `본문 추출 실패 (${url})`;
+        continue;
+      }
+
+      return {
+        ...candidate,
+        link: canonicalKinQuestionUrl(candidate.link),
+        title: pageTitle || candidate.title,
+        questionText,
+        questionTextVerified: true,
+        questionSourceUrl: url,
+      };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
     }
-    return {
-      ...candidate,
-      link: canonicalUrl,
-      title: pageTitle || candidate.title,
-      questionText,
-      questionTextVerified: Boolean(questionText),
-    };
-  } catch (error) {
-    console.warn(`[KIN monitor] 질문 원문 확인 실패: ${canonicalUrl} · ${error instanceof Error ? error.message : String(error)}`);
-    return {
-      ...candidate,
-      link: canonicalUrl,
-      questionText: "",
-      questionTextVerified: false,
-    };
   }
+
+  const canonicalUrl = canonicalKinQuestionUrl(candidate.link);
+  console.warn(`[KIN monitor] 질문 원문 확인 실패: ${canonicalUrl} · ${lastError || "알 수 없는 오류"}`);
+  return {
+    ...candidate,
+    link: canonicalUrl,
+    questionText: "",
+    questionTextVerified: false,
+  };
+}
+
+function kinQuestionFetchUrls(value) {
+  try {
+    const url = new URL(value);
+    const dirId = url.searchParams.get("dirId") || extractPathPart(url.pathname, "dirs");
+    const docId = url.searchParams.get("docId") || extractPathPart(url.pathname, "docs");
+    if (!docId) return [canonicalKinQuestionUrl(value)];
+
+    const candidates = [];
+    if (dirId) candidates.push(`https://m.kin.naver.com/qna/dirs/${encodeURIComponent(dirId)}/docs/${encodeURIComponent(docId)}`);
+    candidates.push(canonicalKinQuestionUrl(value));
+    if (dirId) {
+      candidates.push(`https://m.kin.naver.com/qna/detail.naver?dirId=${encodeURIComponent(dirId)}&docId=${encodeURIComponent(docId)}`);
+    }
+    return [...new Set(candidates.filter(Boolean))];
+  } catch {
+    return [canonicalKinQuestionUrl(value)];
+  }
+}
+
+function extractPathPart(pathname, marker) {
+  const parts = String(pathname || "").split("/").filter(Boolean);
+  const index = parts.indexOf(marker);
+  return index >= 0 ? parts[index + 1] || "" : "";
 }
 
 function validateHydratedQuestion(candidate) {
@@ -267,17 +307,90 @@ function validateHydratedQuestion(candidate) {
 }
 
 function extractKinQuestionText(html) {
-  const candidates = [
-    extractHtmlByClass(html, "questionDetail"),
-    extractHtmlByClass(html, "c-heading__content"),
-    extractHtmlByClass(html, "question-content"),
-    extractHtmlByClass(html, "_endContentsText"),
+  // 1) 구조화 데이터에 Question 본문이 있으면 가장 먼저 사용합니다.
+  const structured = extractQuestionTextFromJsonLd(html);
+  if (isUsableQuestionText(structured)) return normalizeQuestionText(structured);
+
+  // 2) PC/모바일 지식iN에서 사용해온 질문 본문 클래스들을 확인합니다.
+  const classCandidates = [
+    "questionDetail",
+    "c-heading__content",
+    "question-content",
+    "_endContentsText",
   ];
-  for (const value of candidates) {
+  for (const className of classCandidates) {
+    const value = extractHtmlByClass(html, className);
     const text = htmlToText(value);
-    if (text.length >= 2) return text.slice(0, 1800);
+    if (isUsableQuestionText(text)) return normalizeQuestionText(text);
+  }
+
+  // 3) 모바일 페이지의 메타 description이 질문 본문을 담고 있는 경우를 마지막 보조 경로로 사용합니다.
+  const metaCandidates = [
+    extractMetaContent(html, "og:description"),
+    extractMetaNameContent(html, "description"),
+  ];
+  for (const value of metaCandidates) {
+    const text = htmlToText(value);
+    if (isUsableQuestionText(text)) return normalizeQuestionText(text);
+  }
+
+  return "";
+}
+
+function extractQuestionTextFromJsonLd(html) {
+  const scripts = [...String(html || "").matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+  for (const match of scripts) {
+    try {
+      const parsed = JSON.parse(decodeHtmlEntities(match[1]).trim());
+      const found = findQuestionNode(parsed);
+      if (found) {
+        const value = found.text || found.description || "";
+        if (isUsableQuestionText(value)) return value;
+      }
+    } catch {
+      // 일부 페이지의 JSON-LD가 완전한 JSON이 아닐 수 있으므로 다음 후보를 계속 확인합니다.
+    }
   }
   return "";
+}
+
+function findQuestionNode(value) {
+  if (!value || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findQuestionNode(item);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  const type = Array.isArray(value["@type"]) ? value["@type"] : [value["@type"]];
+  if (type.some((item) => String(item || "").toLowerCase() === "question")) return value;
+
+  for (const child of Object.values(value)) {
+    const found = findQuestionNode(child);
+    if (found) return found;
+  }
+  return null;
+}
+
+function isUsableQuestionText(value) {
+  const text = cleanText(value || "");
+  if (text.length < 2) return false;
+  const lower = text.toLowerCase();
+  const blocked = [
+    "네이버 지식in", "지식인에서 답변", "답변을 입력해주세요", "메뉴 더보기", "답변 1개", "답변 2개",
+    "페이지를 찾을 수 없습니다", "접근이 제한", "서비스 이용이 제한",
+  ];
+  return !blocked.some((term) => lower.includes(term.toLowerCase()));
+}
+
+function normalizeQuestionText(value) {
+  return htmlToText(value)
+    .replace(/^질문\s*/i, "")
+    .replace(/\s*답변\s*\d+개[\s\S]*$/i, "")
+    .trim()
+    .slice(0, 1800);
 }
 
 function extractKinQuestionTitle(html) {
@@ -299,7 +412,12 @@ function cleanKinTitle(value) {
 
 function extractHtmlByClass(html, className) {
   const escaped = escapeRegExp(className);
-  const pattern = new RegExp(`<([a-z0-9]+)[^>]*class=["'][^"']*(?:^|\\s)${escaped}(?:\\s|$)[^"']*["'][^>]*>([\\s\\S]*?)<\\/\\1>`, "i");
+  // 기존 정규식은 class 속성의 첫 번째 토큰이 questionDetail인 경우를 놓칠 수 있었습니다.
+  // 클래스 위치와 관계없이 정확한 class token을 찾도록 수정합니다.
+  const pattern = new RegExp(
+    `<([a-z0-9]+)[^>]*class=["'][^"']*\\b${escaped}\\b[^"']*["'][^>]*>([\\s\\S]*?)<\\/\\1>`,
+    "i",
+  );
   return html.match(pattern)?.[2] || "";
 }
 
@@ -308,6 +426,19 @@ function extractMetaContent(html, propertyName) {
   const patterns = [
     new RegExp(`<meta[^>]+property=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, "i"),
     new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+property=["']${escaped}["'][^>]*>`, "i"),
+  ];
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return "";
+}
+
+function extractMetaNameContent(html, name) {
+  const escaped = escapeRegExp(name);
+  const patterns = [
+    new RegExp(`<meta[^>]+name=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, "i"),
+    new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+name=["']${escaped}["'][^>]*>`, "i"),
   ];
   for (const pattern of patterns) {
     const match = html.match(pattern);
@@ -522,7 +653,7 @@ function resolveNotionProperties(properties) {
   return {
     title,
     url,
-    foundAt: findProperty(entries, ["발견일", "발견 일시", "수집일", "Created"], "date"),
+    foundAt: findProperty(entries, ["발견일시", "발견 일시", "발견일", "수집일", "Created"], "date"),
     score: findProperty(entries, ["점수", "우선순위 점수", "Score"], "number"),
     evergreen: findProperty(entries, ["에버그린", "Evergreen"], "number"),
     demand: findProperty(entries, ["유사 질문", "독립 질문", "반복 수요"], "number"),
