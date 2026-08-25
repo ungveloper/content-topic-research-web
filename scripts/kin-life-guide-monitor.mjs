@@ -2,9 +2,11 @@ const NAVER_BASE_URL = process.env.NAVER_API_HUB_BASE_URL || "https://naverapihu
 const NOTION_VERSION = "2026-03-11";
 const SCORE_THRESHOLD = numberEnv("MONITOR_SCORE_THRESHOLD", 8);
 const MAX_PAGES_PER_RUN = integerEnv("MONITOR_MAX_PAGES_PER_RUN", 5, 1, 20);
-const SEEDS_PER_RUN = integerEnv("MONITOR_SEEDS_PER_RUN", 8, 1, 20);
+const SEEDS_PER_RUN = integerEnv("MONITOR_SEEDS_PER_RUN", 28, 1, 40);
 const SEARCH_DISPLAY = 50;
 const MAX_DEDUPE_CHECKS = 14;
+const MAX_RAW_SCORE = 14.5;
+const MAX_EVERGREEN_SCORE = 3;
 
 const seeds = [
   ["휴대폰 백업 복원 데이터 이전", "디지털 생활"],
@@ -169,7 +171,7 @@ async function main() {
 
     await createNotionPage(candidate, notionProperties);
     created += 1;
-    console.log(`[KIN monitor] Notion 등록: ${candidate.title} · ${candidate.totalScore.toFixed(1)}점`);
+    console.log(`[KIN monitor] Notion 등록: ${candidate.title} · ${scoreToPercent(candidate.totalScore, MAX_RAW_SCORE)}점/100 (raw ${candidate.totalScore.toFixed(1)}/${MAX_RAW_SCORE})`);
     await sleep(360);
   }
 
@@ -180,8 +182,8 @@ async function main() {
 
 function rotatingSeedBatch() {
   const batches = Math.ceil(seeds.length / SEEDS_PER_RUN);
-  const tenMinuteSlot = Math.floor(Date.now() / 600_000);
-  const batchIndex = tenMinuteSlot % batches;
+  const halfHourSlot = Math.floor(Date.now() / 1_800_000);
+  const batchIndex = halfHourSlot % batches;
   const start = batchIndex * SEEDS_PER_RUN;
   return seeds.slice(start, start + SEEDS_PER_RUN);
 }
@@ -311,7 +313,9 @@ function extractKinQuestionText(html) {
   const structured = extractQuestionTextFromJsonLd(html);
   if (isUsableQuestionText(structured)) return normalizeQuestionText(structured);
 
-  // 2) PC/모바일 지식iN에서 사용해온 질문 본문 클래스들을 확인합니다.
+  // 2) PC/모바일 지식iN의 실제 질문 본문 영역을 확인합니다.
+  // 단순 정규식으로 첫 닫는 태그까지만 자르면 중첩 div 때문에 본문이 잘릴 수 있어
+  // 동일 태그의 깊이를 세는 방식으로 전체 요소를 추출합니다.
   const classCandidates = [
     "questionDetail",
     "c-heading__content",
@@ -320,20 +324,12 @@ function extractKinQuestionText(html) {
   ];
   for (const className of classCandidates) {
     const value = extractHtmlByClass(html, className);
-    const text = htmlToText(value);
-    if (isUsableQuestionText(text)) return normalizeQuestionText(text);
+    const extracted = htmlToText(value);
+    if (isUsableQuestionText(extracted)) return normalizeQuestionText(extracted);
   }
 
-  // 3) 모바일 페이지의 메타 description이 질문 본문을 담고 있는 경우를 마지막 보조 경로로 사용합니다.
-  const metaCandidates = [
-    extractMetaContent(html, "og:description"),
-    extractMetaNameContent(html, "description"),
-  ];
-  for (const value of metaCandidates) {
-    const text = htmlToText(value);
-    if (isUsableQuestionText(text)) return normalizeQuestionText(text);
-  }
-
+  // meta description은 검색/공유용으로 중간에 ... 형태로 잘릴 수 있으므로
+  // 질문 본문으로 저장하지 않습니다. 다음 원문 URL 후보를 계속 확인하도록 빈 값을 반환합니다.
   return "";
 }
 
@@ -390,7 +386,8 @@ function normalizeQuestionText(value) {
     .replace(/^질문\s*/i, "")
     .replace(/\s*답변\s*\d+개[\s\S]*$/i, "")
     .trim()
-    .slice(0, 1800);
+    // 비정상적으로 큰 페이지 전체 텍스트가 들어오는 사고만 막고 일반 질문 본문은 끝까지 보존합니다.
+    .slice(0, 8000);
 }
 
 function extractKinQuestionTitle(html) {
@@ -412,13 +409,32 @@ function cleanKinTitle(value) {
 
 function extractHtmlByClass(html, className) {
   const escaped = escapeRegExp(className);
-  // 기존 정규식은 class 속성의 첫 번째 토큰이 questionDetail인 경우를 놓칠 수 있었습니다.
-  // 클래스 위치와 관계없이 정확한 class token을 찾도록 수정합니다.
-  const pattern = new RegExp(
-    `<([a-z0-9]+)[^>]*class=["'][^"']*\\b${escaped}\\b[^"']*["'][^>]*>([\\s\\S]*?)<\\/\\1>`,
+  const source = String(html || "");
+  const openPattern = new RegExp(
+    `<([a-z0-9]+)\\b[^>]*class=["'][^"']*\\b${escaped}\\b[^"']*["'][^>]*>`,
     "i",
   );
-  return html.match(pattern)?.[2] || "";
+  const openMatch = openPattern.exec(source);
+  if (!openMatch) return "";
+
+  const tagName = openMatch[1].toLowerCase();
+  const contentStart = openMatch.index + openMatch[0].length;
+  const tokenPattern = new RegExp(`<\\/?${escapeRegExp(tagName)}\\b[^>]*>`, "gi");
+  tokenPattern.lastIndex = contentStart;
+  let depth = 1;
+  let token;
+
+  while ((token = tokenPattern.exec(source))) {
+    const tokenText = token[0];
+    const isClosing = tokenText.startsWith("</");
+    const isSelfClosing = /\/\s*>$/.test(tokenText);
+    if (isClosing) depth -= 1;
+    else if (!isSelfClosing) depth += 1;
+
+    if (depth === 0) return source.slice(contentStart, token.index);
+  }
+
+  return "";
 }
 
 function extractMetaContent(html, propertyName) {
@@ -691,14 +707,14 @@ async function createNotionPage(candidate, props) {
   };
 
   if (props.foundAt) properties[props.foundAt.name] = { date: { start: new Date().toISOString() } };
-  if (props.score) properties[props.score.name] = { number: round1(candidate.totalScore) };
-  if (props.evergreen) properties[props.evergreen.name] = { number: candidate.evergreenScore };
+  if (props.score) properties[props.score.name] = { number: scoreToPercent(candidate.totalScore, MAX_RAW_SCORE) };
+  if (props.evergreen) properties[props.evergreen.name] = { number: scoreToPercent(candidate.evergreenScore, MAX_EVERGREEN_SCORE) };
   if (props.demand) properties[props.demand.name] = { number: candidate.independentQuestionCount };
   if (props.summary) {
     const summary = candidate.questionTextVerified
       ? candidate.questionText
       : "원문 질문 본문을 자동으로 확인하지 못했습니다. 원문 URL에서 직접 확인이 필요합니다.";
-    properties[props.summary.name] = { rich_text: richText(summary, 1200) };
+    properties[props.summary.name] = { rich_text: richTextChunks(summary, 1800, 8000) };
   }
   setExistingSelect(properties, props.category, "생활 가이드");
   setExistingSelect(properties, props.area, candidate.area);
@@ -707,8 +723,8 @@ async function createNotionPage(candidate, props) {
   const bodyLines = [
     `**공개 카테고리:** 생활 가이드`,
     `**내부 분류:** ${candidate.area}`,
-    `**스크립트 검토 점수:** ${candidate.totalScore.toFixed(1)} / 참고용`,
-    `**에버그린 힌트:** ${candidate.evergreenScore}/3`,
+    `**스크립트 검토 점수:** ${scoreToPercent(candidate.totalScore, MAX_RAW_SCORE)}/100 · 내부 raw ${candidate.totalScore.toFixed(1)}/${MAX_RAW_SCORE}`,
+    `**에버그린 힌트:** ${scoreToPercent(candidate.evergreenScore, MAX_EVERGREEN_SCORE)}/100 · 내부 raw ${candidate.evergreenScore}/${MAX_EVERGREEN_SCORE}`,
     `**반복 수요 힌트:** 독립 URL ${candidate.independentQuestionCount}건`,
     `**최신성 힌트:** 지식iN 최신순 결과 ${candidate.dateRank}위에서 신규 발견`,
     `**탐색어:** ${candidate.matchedSeeds.join(" · ")}`,
@@ -777,6 +793,21 @@ function richText(content, maxLength) {
     return [{ type: "text", text: { content: bold[1] }, annotations: { bold: true } }];
   }
   return [{ type: "text", text: { content: text } }];
+}
+
+function richTextChunks(content, chunkSize = 1800, maxTotal = 8000) {
+  const text = String(content || "").slice(0, maxTotal);
+  if (!text) return [];
+  const chunks = [];
+  for (let index = 0; index < text.length; index += chunkSize) {
+    chunks.push({ type: "text", text: { content: text.slice(index, index + chunkSize) } });
+  }
+  return chunks;
+}
+
+function scoreToPercent(value, maxValue) {
+  if (!Number.isFinite(value) || !Number.isFinite(maxValue) || maxValue <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((value / maxValue) * 100)));
 }
 
 function cleanText(value) {
